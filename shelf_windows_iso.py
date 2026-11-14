@@ -113,7 +113,7 @@ def open_windows_iso(version, checksum):
     if not isinstance(checksum, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", checksum):
         raise ValueError("Microsoft did not publish a valid English x64 ISO checksum.")
 
-    request = Request(windows_iso_url(version), headers={"User-Agent": f"ReleaseShelf/{__version__}"})
+    request = Request(windows_iso_url(version), headers={"User-Agent": f"Relf/{__version__}"})
     check_canceled()
     try:
         response = build_opener(MicrosoftRedirect()).open(request, timeout=30)
