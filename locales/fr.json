@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "L’identifiant d’élément « {app_id} » est déjà utilisé par {owner}.",
   "Options": "Options",
   "Language": "Langue",
+  "Download folder": "Dossier de téléchargement",
+  "Restart Relf to use the selected folder.": "Redémarrez Relf pour utiliser le dossier sélectionné.",
   "Appearance": "Apparence",
   "Show item icons": "Afficher les icônes des éléments",
   "System": "Système",

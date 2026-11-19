@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "{owner} don dey use di item ID “{app_id}”.",
   "Options": "Settings",
   "Language": "Language",
+  "Download folder": "Download folder",
+  "Restart Relf to use the selected folder.": "Start Relf again to use di folder wey you choose.",
   "Appearance": "How e look",
   "Show item icons": "Show item icons",
   "System": "Follow system",

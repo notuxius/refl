@@ -20,7 +20,7 @@ from fetch_sources import Recipe
 from fetch_store import Result, apply_published_settings, read_state
 from recipe_editor import ACTIONS, ACTION_ICONS, RecipeEditor, save_recipe
 from releaseshelf import (ERRORS, MAX_PARALLEL_ITEMS, UPDATE_RETRY_DELAYS, ChecklistLoadError,
-                          add_recipes_argument, batch_map, default_destination,
+                          add_recipes_argument, batch_map, default_destination, destination_preference_path,
                           execute, load_targets, local_result, prepare_fetch, read_jobs, updates_disabled)
 from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, load_app_icon, store_product_id
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
@@ -828,6 +828,20 @@ class ShelfWindow:
         table.columnconfigure(1, minsize=1)
         table.grid(row=2, column=0, sticky="nsew")
         self.column_widths = COLUMN_WIDTHS.copy()
+        self.widths_file = self.appearance_file.with_name("column-widths.json")
+        try:
+            saved = json.loads(self.widths_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        self.saved_widths = {"tracked": {}, "checklist": {}}
+        for layout, widths in self.saved_widths.items():
+            stored = saved.get(layout) if isinstance(saved, dict) else None
+            if isinstance(stored, dict):
+                for name in ("#0", *COLUMN_WIDTHS):
+                    value = stored.get(name)
+                    if type(value) is int and 1 <= value <= 32767:
+                        widths[name] = value
+        self.divider_pressed = False
         cols = tuple(self.column_widths)
         show = ("tree", "headings") if self.show_app_icons.get() else "headings"
         self.tree = FittedTreeview(table, columns=cols, show=show, selectmode="browse", height=4)
@@ -846,11 +860,18 @@ class ShelfWindow:
             for sequence in ("<ButtonPress>", "<ButtonRelease>", "<B1-Motion>", "<MouseWheel>"):
                 bar.bind(sequence, self.forward_row_pointer)
             self.row_bars.append(bar)
-        self.tree.bind("<Map>", self.fit_columns, add="+")
+        # Initialize stretch widths once the table has space. Restore keeps its current widths.
+        def fit_on_first_map(_event):
+            self.tree.unbind("<Map>", first_map)
+            self.fit_columns()
+
+        first_map = self.tree.bind("<Map>", fit_on_first_map, add="+")
         self.tree.bind("<<TreeviewSelect>>", self.controls)
         self.tree.bind("<Button-1>", self.click_checkbox)
         self.tree.bind("<space>", self.toggle_focused_checkbox)
-        self.tree.bind("<Double-Button-1>", self.open_row)
+        self.tree.bind("<Double-Button-1>", self.open_row, add="+")
+        self.tree.bind("<ButtonRelease-1>", self.finish_column_drag, add="+")
+        self.tree.bind("<<DividerFitted>>", self.remember_column_widths)
         self.tree.bind("<Return>", self.open_row)
         self.build_column_menu()
         self.app_menu = AppMenu(self.tree)
@@ -966,16 +987,31 @@ class ShelfWindow:
             self.tree.tk.call(self.tree, "heading", name, "state", state)
         self.fit_columns()
 
-    def fit_columns(self, event=None):
+    def fit_columns(self):
         # Changing displaycolumns alone leaves ttk's old stretch allocation in place.
         # Start from the preferred widths so repeated toggles produce a stable layout.
+        checklist = self.view.get() == "checklist"
+        saved = self.saved_widths["checklist" if checklist else "tracked"]
+        self.tree.column("#0", width=saved.get("#0", 36))
         for name in self.tree["displaycolumns"]:
-            self.tree.column(name, width=self.column_widths[name])
-        if self.view.get() == "checklist":
-            self.tree.column("Status", stretch=False,
-                             width=max(self.column_widths["Status"], self.checklist_status_width))
-        else:
-            self.tree.column("Status", stretch=True)
+            width = self.column_widths[name]
+            if checklist and name == "Status":
+                width = max(width, self.checklist_status_width)
+            self.tree.column(name, width=saved.get(name, width))
+
+    def finish_column_drag(self, event):
+        if self.divider_pressed:
+            self.divider_pressed = False
+            self.remember_column_widths(event)
+
+    def remember_column_widths(self, _event):
+        saved = self.saved_widths["checklist" if self.view.get() == "checklist" else "tracked"]
+        for name in ("#0", *self.tree["displaycolumns"]):
+            saved[name] = self.tree.column(name, "width")
+        try:
+            write_preference(self.widths_file, json.dumps(self.saved_widths))
+        except OSError as exc:
+            self.set_status("Could not save preference: {error}", error=exc)
 
     def change_columns(self):
         self.apply_columns()
@@ -986,7 +1022,9 @@ class ShelfWindow:
             self.set_status("Columns changed for this session. Could not save preference: {error}", error=exc)
 
     def click_checkbox(self, event):
-        if self.view.get() == "checklist" and self.tree.identify_region(event.x, event.y) == "tree":
+        region = self.tree.identify_region(event.x, event.y)
+        self.divider_pressed = region == "separator"
+        if self.view.get() == "checklist" and region == "tree":
             if key := self.tree.identify_row(event.y):
                 self.tree.selection_set(key)
                 self.tree.focus(key)
@@ -1081,7 +1119,8 @@ class ShelfWindow:
         if self.options is None:
             self.options = OptionsWindow(self.root, self.mode, self.palette_name, self.change_mode, self.palette,
                                          language=self.language, on_language_change=self.change_language,
-                                         show_app_icons=self.show_app_icons, on_app_icons_change=self.change_app_icons)
+                                         show_app_icons=self.show_app_icons, on_app_icons_change=self.change_app_icons,
+                                         destination=self.dest, destination_file=destination_preference_path())
             self.options.bind("<Destroy>", self.options_closed, add="+")
             show_window(self.options)
         else:

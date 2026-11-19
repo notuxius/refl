@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "O ID de item “{app_id}” já está em uso por {owner}.",
   "Options": "Opções",
   "Language": "Idioma",
+  "Download folder": "Pasta de downloads",
+  "Restart Relf to use the selected folder.": "Reinicie o Relf para usar a pasta selecionada.",
   "Appearance": "Aparência",
   "Show item icons": "Mostrar ícones dos itens",
   "System": "Sistema",

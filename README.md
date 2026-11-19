@@ -28,6 +28,8 @@ Click the search field or press **Ctrl+F** to focus the field. Type or paste up 
 
 The app list starts sorted by **Category** in ascending order. Click **Name**, **Category**, or **Status** to sort by that column. Click the same header again to reverse the order. The arrow shows the current direction.
 
+Drag a divider to resize a column. Double-click it to fit the heading and the values on the current page within the available table width. Tracked and its filtered views share column widths. Checklist remembers its own widths.
+
 Right-click any column header to show or hide columns in the app list. The menu lists every column in table order. Relf remembers your choices across views and restarts. At least one text column stays visible.
 
 Select **Item icon** in the column menu or **Show item icons** in Options to display the icon column before **Name**. ISO images show a CD icon. For Microsoft Store web installers, Relf looks up the product logo in the background and saves it for offline use. On Windows, Relf reads EXE icons and MSI product icons. For ZIPs, it tries the extracted app executable, then EXEs inside the archive from the shallowest folder first, then packaged ICO files. For an app without embedded artwork, place a 16 × 16 PNG in the app list’s `icons` subfolder with the same base filename as its recipe. Other rows use the Relf icon.
@@ -101,7 +103,7 @@ For ZIPs with selected members, the first member in `extract` is the primary fil
 
 New installations store downloads in `%USERPROFILE%\Downloads\Relf`. On upgrade, Relf keeps using an existing `Downloads\PortableFetch` or `Downloads\ReleaseShelf` folder, in that order, so shortcuts and target mappings keep working. The previous `releaseshelf.py`, `releaseshelf_ui.pyw`, and `portable_fetch.py` launchers still work.
 
-To change the cache root, pass the same `--dest PATH` for every command. To update an existing portable executable at its usual path, put a machine-local `targets.json` inside that cache root. For example:
+To set the download folder, open **Options → Download folder → Browse…** and select a folder. Restart Relf to use the new location. The CLI reads the same setting from `%LOCALAPPDATA%\Relf\destination.txt`. Use `--dest PATH` to override it for a single launch or command. To update an existing portable executable at its usual path, put a machine-local `targets.json` inside the download folder. For example:
 
 ```json
 {

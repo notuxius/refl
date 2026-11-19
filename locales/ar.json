@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "معرّف العنصر «{app_id}» مستخدم بالفعل في {owner}.",
   "Options": "الخيارات",
   "Language": "اللغة",
+  "Download folder": "مجلد التنزيلات",
+  "Restart Relf to use the selected folder.": "أعِد تشغيل Relf لاستخدام المجلد المحدد.",
   "Appearance": "المظهر",
   "Show item icons": "إظهار أيقونات العناصر",
   "System": "النظام",

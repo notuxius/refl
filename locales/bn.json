@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "“{app_id}” আইটেম আইডিটি ইতিমধ্যে {owner} ব্যবহার করছে।",
   "Options": "বিকল্প",
   "Language": "ভাষা",
+  "Download folder": "ডাউনলোড ফোল্ডার",
+  "Restart Relf to use the selected folder.": "নির্বাচিত ফোল্ডারটি ব্যবহার করতে Relf আবার চালু করুন।",
   "Appearance": "চেহারা",
   "Show item icons": "আইটেমের আইকন দেখান",
   "System": "সিস্টেম অনুযায়ী",

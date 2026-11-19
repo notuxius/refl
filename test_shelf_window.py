@@ -4,6 +4,7 @@ import gc
 import hashlib
 import io
 import json
+import os
 import stat
 from pathlib import Path
 import subprocess
@@ -19,6 +20,7 @@ from unittest.mock import patch
 import zipfile
 
 from fetch_store import Result
+from releaseshelf import default_destination, destination_preference_path
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_delete import DELETE, FOLDER, delete_item, deletion_plan
 from shelf_checkboxes import header_image
@@ -485,6 +487,38 @@ class DesktopTest(unittest.TestCase):
         reopened.options_button.invoke()
         self.assertEqual(reopened.options.language_button.cget("text"), "اردو")
 
+    def test_download_folder_picker_saves_the_default_for_next_launch(self):
+        next_folder = self.dest.with_name("Other downloads")
+        next_folder.mkdir()
+        targets = next_folder / "targets.json"
+        targets.write_text('{"alpha": "relative.exe"}', encoding="utf-8")
+        with patch.dict(os.environ, LOCALAPPDATA=str(self.appearance.parent)):
+            setting = destination_preference_path()
+            self.ui.options_button.invoke()
+            options = self.ui.options
+            self.assertEqual(options.download_folder.get(), str(self.dest))
+            with patch("shelf_options.filedialog.askdirectory", return_value="") as picker:
+                options.browse_button.invoke()
+                self.assertEqual(picker.call_args.kwargs["initialdir"], str(self.dest))
+            self.assertFalse(setting.exists())
+
+            with patch("shelf_options.filedialog.askdirectory", return_value=str(next_folder)), \
+                    patch("shelf_options.messagebox.showerror") as error:
+                options.browse_button.invoke()
+                error.assert_called_once()
+                self.assertFalse(setting.exists())
+                self.assertEqual(options.download_folder.get(), str(self.dest))
+                targets.unlink()
+                options.browse_button.invoke()
+
+            self.assertEqual(default_destination(), next_folder)
+            self.assertEqual(self.ui.dest, self.dest)
+            self.assertEqual(options.download_hint.cget("text"), "Restart Relf to use the selected folder.")
+            options.close_button.invoke()
+            self.ui.options_button.invoke()
+            self.assertEqual(self.ui.options.download_folder.get(), str(next_folder))
+            self.assertEqual(self.ui.options.download_hint.cget("text"), "Restart Relf to use the selected folder.")
+
     def assert_dropdown_join(self, trigger, menu, *, below):
         self.assertTrue(trigger.instate(["selected"]))
         self.assertEqual(menu.arrow.cget("text"), "▲")
@@ -756,6 +790,8 @@ class DesktopTest(unittest.TestCase):
             dialog.script.insert("end", "\n'latest'")
             dialog.tabs.select(1)
             self.root.update()
+            # Collect the two closed editors on the Tk thread before starting the worker.
+            gc.collect()
             dialog.apply_button.invoke()
             self.wait_for(lambda: not dialog.running)
             run.assert_called_once()
@@ -1480,6 +1516,78 @@ class DesktopTest(unittest.TestCase):
         bars = (child for child in tree.master.winfo_children() if isinstance(child, ttk.Scrollbar))
         self.assertFalse(any(bar.winfo_ismapped() for bar in bars))
 
+    def test_divider_drag_and_autofit_survive_switching_pages(self):
+        ui = self.ui
+        self.root.geometry("1150x680")
+        self.root.deiconify()
+        self.root.update()
+        tree = ui.tree
+
+        def divider(column):
+            return next(x for x in range(tree.winfo_width()) if tree.identify_region(x, 10) == "separator"
+                        and tree.column(tree.identify_column(x), "id") == column)
+
+        def drag(column, distance, timestamp):
+            x = divider(column)
+            tree.event_generate("<ButtonPress-1>", x=x, y=10, time=timestamp)
+            tree.event_generate("<B1-Motion>", x=x + distance, y=10, time=timestamp + 20)
+            tree.event_generate("<ButtonRelease-1>", x=x + distance, y=10, time=timestamp + 40)
+            self.root.update()
+
+        def width():
+            return tree.column("Name", "width")
+
+        before = width()
+        drag("Name", 48, 1000)
+        tracked = width()
+        self.assertGreater(tracked, before + 40)
+        ui.select_view("local")
+        self.root.update()
+        self.assertEqual(width(), tracked)
+        ui.select_view("checklist")
+        self.root.update()
+        before = width()
+        drag("Name", -68, 2000)
+        checklist = width()
+        self.assertLess(checklist, before - 60)
+        ui.select_view("all")
+        self.root.update()
+        self.assertEqual(width(), tracked)
+        ui.select_view("checklist")
+        self.root.update()
+        self.assertEqual(width(), checklist)
+        ui.select_view("all")
+        self.root.update()
+        ui.search.set("alpha")
+        tree.set_values(self.keys[1], ("Hidden long name " * 10, "", "", "", "", ""))
+        label = "A column value wider than its heading"
+        tree.set_values(self.keys[0], (label, "", "", "", "", ""))
+        x = divider("Name")
+        for timestamp in (3000, 3070):
+            tree.event_generate("<ButtonPress-1>", x=x, y=10, time=timestamp)
+            tree.event_generate("<ButtonRelease-1>", x=x, y=10, time=timestamp + 20)
+        self.root.update()
+        fitted = tree.measure(tree.row_font, label) + tree.cell_insets
+        self.assertEqual(width(), fitted)
+        self.assertIsNone(ui.editor)
+        ui.select_view("checklist")
+        ui.select_view("all")
+        self.root.update()
+        self.assertEqual(width(), fitted)
+        second = tk.Toplevel(self.root)
+        self.addCleanup(second.destroy)
+        reopened = ShelfWindow(second, ui.catalog, self.dest, ui.targets, appearance_file=self.appearance)
+        second.geometry(self.root.geometry())
+        self.root.update()
+        # Match the table viewport after the new window lays out its sidebar.
+        delta = tree.winfo_width() - reopened.tree.winfo_width()
+        second.geometry(f"{second.winfo_width() + delta}x{second.winfo_height()}")
+        self.root.update()
+        self.assertEqual(reopened.tree.column("Name", "width"), fitted)
+        reopened.select_view("checklist")
+        self.root.update()
+        self.assertEqual(reopened.tree.column("Name", "width"), checklist)
+
     def test_visible_columns_fill_table_after_hiding_and_resizing(self):
         self.root.geometry("1120x680")
         self.root.deiconify()
@@ -1537,6 +1645,76 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         self.assertEqual(tree.set(str(path), "Name"), name)
         self.assertEqual(ui.name(str(path)), name)
+
+    def test_names_still_fit_after_minimize_and_restore(self):
+        ui = self.ui
+        name = "Open the advanced mouse settings"
+        checklist = ui.catalog / "mouse.json"
+        checklist.write_text(json.dumps({"id": "mouse", "type": "checklist", "name": name,
+                                         "steps": [{"label": name, "description": name, "powershell": "unused"}]}))
+        app = Path(self.keys[0])
+        app.write_text(json.dumps({**json.loads(app.read_text()), "name": name}))
+        ui.reload()
+        self.root.geometry("1120x680")
+        self.root.deiconify()
+        self.root.update()
+        for column in ui.tree["columns"][1:]:
+            ui.column_menu.buttons[column].invoke()
+        for view, path in (("checklist", checklist), ("all", app)):
+            with self.subTest(view=view):
+                ui.select_view(view)
+                self.root.update()
+                self.assertEqual(ui.tree.set(str(path), "Name"), name)
+                self.root.iconify()
+                self.root.update()
+                self.root.deiconify()
+                self.root.update()
+                self.assertEqual(ui.tree.set(str(path), "Name"), name)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows restore presentation")
+    def test_restore_paints_page_before_revealing_window(self):
+        from shelf_paint import show_window, stage_window
+
+        root = self.root
+        stage_window(root)
+        root.deiconify()
+        show_window(root)
+        widgets = (self.ui.tree, self.ui.title_label, self.ui.sidebar)
+        painted = set()
+        for widget in widgets:
+            widget.bind("<Expose>", lambda event: painted.add((event.widget, root.attributes("-alpha"))), add="+")
+        for state in ("normal", "zoomed"):
+            with self.subTest(state=state):
+                root.state(state)
+                root.update()
+                root.iconify()
+                root.update()
+                self.assertEqual(root.attributes("-alpha"), 0)
+                painted.clear()
+                root.deiconify()
+                root.update()
+                self.assertTrue(all((widget, 0.0) in painted for widget in widgets))
+                self.assertEqual(root.attributes("-alpha"), 1)
+
+    def test_resizing_skips_writes_for_rows_that_still_fit(self):
+        self.root.geometry("1120x680")
+        self.root.deiconify()
+        self.root.update()
+        tree = self.ui.tree
+        first, second = self.keys
+        for column in tree["columns"][1:]:
+            self.ui.column_menu.buttons[column].invoke()
+        short = ("A", "B", "C", "D", "E", "F")
+        tree.set_values(first, short)
+        tree.set_values(second, ("Windows configuration " * 30, *short[1:]))
+        self.root.update()
+        old = tree.set(second, "Name")
+        with patch.object(tree, "item", wraps=tree.item) as item:
+            self.root.geometry("800x600")
+            self.root.update()
+        writes = {call.args[0] for call in item.call_args_list if "values" in call.kwargs}
+        self.assertEqual(writes, {second})
+        self.assertLess(len(tree.set(second, "Name")), len(old))
 
     def test_hover_reveals_only_clipped_text_in_the_displayed_column(self):
         self.root.geometry("760x430")

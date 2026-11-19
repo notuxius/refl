@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "ID елемента «{app_id}» уже використовується в {owner}.",
   "Options": "Налаштування",
   "Language": "Мова",
+  "Download folder": "Папка завантажень",
+  "Restart Relf to use the selected folder.": "Перезапустіть Relf, щоб використовувати вибрану папку.",
   "Appearance": "Вигляд",
   "Show item icons": "Показувати піктограми елементів",
   "System": "Системна",

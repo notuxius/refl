@@ -54,6 +54,21 @@ class RelfTest(unittest.TestCase):
                 (home / "ReleaseShelf").mkdir()
                 self.assertEqual(preference_path(), home / "ReleaseShelf" / "appearance.txt")
 
+    def test_configured_destination_overrides_legacy_folder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / "Downloads" / "PortableFetch").mkdir(parents=True)
+            settings = home / "Relf"
+            settings.mkdir()
+            destination = home / "My Drive" / "Software" / "Relf"
+            setting = settings / "destination.txt"
+            setting.write_text(str(destination) + "\n", encoding="utf-8-sig")
+            with patch.object(Path, "home", return_value=home), patch.dict(os.environ, LOCALAPPDATA=temp):
+                self.assertEqual(default_destination(), destination)
+                setting.write_text("relative", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "absolute download folder"):
+                    default_destination()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(self.temp.cleanup)

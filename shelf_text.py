@@ -1,5 +1,6 @@
 """Fit single-line display text to the space allocated by Tk."""
 
+from functools import lru_cache, partial
 from tkinter import ttk
 
 
@@ -9,9 +10,16 @@ TK_CELL_INSETS = 8
 CELL_TEXT_INSETS = 2 * TREE_TEXT_PAD + TK_CELL_INSETS
 
 
-def fit_text(widget, font, text, width, suffix=""):
+def _text_width(tk, display, font, value):
+    return tk.getint(tk.call("font", "measure", font, "-displayof", display, value))
+
+
+def fit_text(widget, font, text, width, suffix="", *, measure=None):
+    if measure is None:
+        measure = partial(_text_width, widget.tk, widget._w)
+
     def fits(value):
-        return widget.tk.getint(widget.tk.call("font", "measure", font, "-displayof", widget, value)) <= width
+        return measure(font, value) <= width
 
     line, newline, _ = text.replace("\r\n", "\n").replace("\r", "\n").partition("\n")
     if not newline and fits(line + suffix):
@@ -113,7 +121,10 @@ class FittedTreeview(ttk.Treeview):
     def __init__(self, master, *, cell_insets=CELL_TEXT_INSETS, **options):
         super().__init__(master, **options)
         self.cell_insets = cell_insets
+        # Pixel widths stay the same as columns resize. Reuse them across rows and drag events.
+        self.measure = lru_cache(maxsize=8192)(partial(_text_width, self.tk, self._w))
         self.rows = {}
+        self.displayed_rows = {}
         self.captions = {}
         self.widths = ()
         self.pending_fit = None
@@ -122,6 +133,42 @@ class FittedTreeview(ttk.Treeview):
         for event in ("<Map>", "<Configure>", "<B1-Motion>", "<ButtonRelease-1>"):
             self.bind(event, self.schedule_fit, add="+")
         self.bind("<<ThemeChanged>>", self.theme_changed)
+        self.bind("<Double-Button-1>", self.autofit_divider)
+
+    def autofit_divider(self, event):
+        if self.identify_region(event.x, event.y) != "separator":
+            return
+        display = self.identify_column(event.x)
+        if display == "#0":
+            self.column("#0", width=self.column("#0", "minwidth"))
+            self.event_generate("<<DividerFitted>>")
+            return "break"
+        col = self.column(display, "id")
+        heading = "".join(self.captions[col])
+        width = self.measure(self.heading_font, heading) + 2 * TREE_TEXT_PAD
+        index = self["columns"].index(col)
+        for row in self.get_children():
+            if row in self.rows:
+                value = str(self.rows[row][index]).split("\n", 1)[0].rstrip("\r")
+                width = max(width, self.measure(self.row_font, value) + self.cell_insets)
+
+        # Keep the table filled. Borrow space from the nearest columns, right side first.
+        columns = list(self["displaycolumns"])
+        if columns == ["#all"]:
+            columns = list(self["columns"])
+        index = columns.index(col)
+        delta = max(width, self.column(col, "minwidth")) - self.column(col, "width")
+        for other in columns[index + 1:] + columns[:index][::-1]:
+            current = self.column(other, "width")
+            take = min(delta, current - self.column(other, "minwidth"))
+            if take:
+                self.column(other, width=current - take)
+                self.column(col, width=self.column(col, "width") + take)
+                delta -= take
+            if not delta:
+                break
+        self.event_generate("<<DividerFitted>>")
+        return "break"
 
     def clipped_text_at(self, x, y):
         region = self.identify_region(x, y)
@@ -144,6 +191,7 @@ class FittedTreeview(ttk.Treeview):
                     return full
 
     def theme_changed(self, _event):
+        self.measure.cache_clear()
         self.widths = ()
         self.schedule_fit()
 
@@ -156,6 +204,7 @@ class FittedTreeview(ttk.Treeview):
     def destroy(self):
         if self.pending_fit is not None:
             self.after_cancel(self.pending_fit)
+        self.measure.cache_clear()
         super().destroy()
 
     def schedule_fit(self, _event=None):
@@ -183,9 +232,11 @@ class FittedTreeview(ttk.Treeview):
 
     def draw_row(self, row, values):
         if self.widths:
-            values = tuple(fit_text(self, self.row_font, str(value), width - self.cell_insets)
+            values = tuple(fit_text(self, self.row_font, str(value), width - self.cell_insets, measure=self.measure)
                            for value, width in zip(values, self.widths, strict=True))
-        self.item(row, values=values)
+        if self.displayed_rows.get(row) != values:
+            self.item(row, values=values)
+            self.displayed_rows[row] = values
 
     def set_caption(self, col, text, suffix=""):
         self.captions[col] = (text, suffix)
@@ -195,10 +246,11 @@ class FittedTreeview(ttk.Treeview):
         caption = text + suffix
         if self.widths:
             width = self.widths[self["columns"].index(col)]
-            caption = fit_text(self, self.heading_font, text, width - 2 * TREE_TEXT_PAD, suffix)
+            caption = fit_text(self, self.heading_font, text, width - 2 * TREE_TEXT_PAD, suffix, measure=self.measure)
         self.heading(col, text=caption)
 
     def delete(self, *items):
         super().delete(*items)
         for row in items:
             self.rows.pop(row, None)
+            self.displayed_rows.pop(row, None)

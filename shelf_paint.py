@@ -64,6 +64,20 @@ def show_window(window):
         _finish_paint(window)
         window.attributes("-alpha", 1)
 
+        def hide_on_unmap(event):
+            if event.widget is window:
+                window.attributes("-alpha", 0)
+
+        def reveal_on_map(event):
+            if event.widget is window:
+                _finish_paint(window)
+                if window.winfo_viewable():
+                    window.attributes("-alpha", 1)
+
+        # Stage the window while hidden so Windows cannot present half-painted children on restore.
+        window.bind("<Unmap>", hide_on_unmap, add="+")
+        window.bind("<Map>", reveal_on_map, add="+")
+
 
 def _copy_client(owner, popup, origin, size):
     with ExitStack() as cleanup:

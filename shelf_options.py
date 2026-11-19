@@ -1,13 +1,16 @@
-"""Language and appearance controls for the Relf desktop app."""
+"""Settings for the Relf desktop app."""
 
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
+from releaseshelf import load_targets, read_destination
 from shelf_i18n import LANGUAGES, tr
 from shelf_icons import make_icon
 from shelf_language_menu import LanguageMenu
+from shelf_message import error_detail
 from shelf_paint import stage_window
-from shelf_theme import PALETTES, THEME_MODES, initial_geometry, style_titlebar
+from shelf_theme import PALETTES, THEME_MODES, initial_geometry, style_titlebar, write_preference
 
 
 def read_language(path):
@@ -20,7 +23,7 @@ def read_language(path):
 
 class OptionsWindow(tk.Toplevel):
     def __init__(self, parent, mode, palette_name, on_change, palette, *, language, on_language_change,
-                 show_app_icons, on_app_icons_change):
+                 show_app_icons, on_app_icons_change, destination, destination_file):
         super().__init__(parent)
         stage_window(self)
         self.transient(parent)
@@ -39,6 +42,25 @@ class OptionsWindow(tk.Toplevel):
         self.language_button = ttk.Button(body, style="LanguagePicker.TMenubutton", compound="left")
         self.language_button.pack(fill="x", pady=(6, 16))
         self.language_menu = LanguageMenu(self.language_button, on_language_change)
+
+        self.destination = destination
+        self.destination_file = destination_file
+        try:
+            folder = (read_destination(destination_file) or destination).resolve()
+        except (OSError, ValueError):
+            folder = destination
+        self.download_folder = tk.StringVar(self, value=str(folder))
+        self.download_heading = ttk.Label(body, font=heading_font)
+        self.download_heading.pack(anchor="w")
+        downloads = ttk.Frame(body)
+        downloads.pack(fill="x", pady=(6, 12))
+        downloads.columnconfigure(0, weight=1)
+        ttk.Entry(downloads, textvariable=self.download_folder, state="readonly", width=12).grid(
+            row=0, column=0, sticky="ew")
+        self.browse_button = ttk.Button(downloads, command=self.choose_download_folder)
+        self.browse_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
+        self.download_hint = ttk.Label(downloads, wraplength=390, style="Small.TLabel")
+        self.download_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         self.appearance_heading = ttk.Label(body, font=heading_font)
         self.appearance_heading.pack(anchor="w")
@@ -87,6 +109,9 @@ class OptionsWindow(tk.Toplevel):
         self.language_heading.configure(text=tr("Language"))
         self.language_button.configure(text=LANGUAGES[code][0])
         self.language_menu.select(code)
+        self.download_heading.configure(text=tr("Download folder"))
+        self.browse_button.configure(text=tr("Browse…"))
+        self.update_download_hint()
         self.appearance_heading.configure(text=tr("Appearance"))
         self.app_icons_button.configure(text=tr("Show item icons"))
         self.palette_heading.configure(text=tr("Palette"))
@@ -97,6 +122,26 @@ class OptionsWindow(tk.Toplevel):
             self.update_idletasks()
             if self.winfo_reqwidth() > self.winfo_width() or self.winfo_reqheight() > self.winfo_height():
                 initial_geometry(self, self.winfo_width(), self.winfo_height(), parent=self.master)
+
+    def choose_download_folder(self):
+        folder = filedialog.askdirectory(parent=self, title=tr("Download folder"),
+                                         initialdir=self.download_folder.get(), mustexist=True)
+        if not folder:
+            return
+        try:
+            destination = Path(folder).resolve(strict=True)
+            load_targets(destination / "targets.json", destination)
+            write_preference(self.destination_file, f"{destination}\n")
+        except (OSError, TypeError, ValueError) as exc:
+            messagebox.showerror(tr("Download folder"), tr("Could not save preference: {error}",
+                                                           error=error_detail(exc)), parent=self)
+            return
+        self.download_folder.set(str(destination))
+        self.update_download_hint()
+
+    def update_download_hint(self):
+        pending = Path(self.download_folder.get()) != self.destination
+        self.download_hint.configure(text=tr("Restart Relf to use the selected folder.") if pending else "")
 
     def apply_theme(self, palette):
         self.palette = palette

@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "条目 ID“{app_id}”已被 {owner} 使用。",
   "Options": "选项",
   "Language": "语言",
+  "Download folder": "下载文件夹",
+  "Restart Relf to use the selected folder.": "重启 Relf 以使用所选文件夹。",
   "Appearance": "外观",
   "Show item icons": "显示条目图标",
   "System": "跟随系统",

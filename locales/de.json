@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "Die Eintrags-ID „{app_id}“ wird bereits von {owner} verwendet.",
   "Options": "Optionen",
   "Language": "Sprache",
+  "Download folder": "Downloadordner",
+  "Restart Relf to use the selected folder.": "Starten Sie Relf neu, um den ausgewählten Ordner zu verwenden.",
   "Appearance": "Darstellung",
   "Show item icons": "Eintragssymbole anzeigen",
   "System": "System",

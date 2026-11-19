@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "ID item “{app_id}” sudah digunakan oleh {owner}.",
   "Options": "Opsi",
   "Language": "Bahasa",
+  "Download folder": "Folder unduhan",
+  "Restart Relf to use the selected folder.": "Mulai ulang Relf untuk menggunakan folder yang dipilih.",
   "Appearance": "Tampilan",
   "Show item icons": "Tampilkan ikon item",
   "System": "Ikuti sistem",

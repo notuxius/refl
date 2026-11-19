@@ -146,6 +146,8 @@
   "Item ID “{app_id}” is already used by {owner}.": "項目 ID「{app_id}」は {owner} で既に使われています。",
   "Options": "オプション",
   "Language": "言語",
+  "Download folder": "ダウンロードフォルダー",
+  "Restart Relf to use the selected folder.": "選択したフォルダーを使うには、Relfを再起動してください。",
   "Appearance": "外観",
   "Show item icons": "項目のアイコンを表示",
   "System": "システムに従う",

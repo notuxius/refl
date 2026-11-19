@@ -92,7 +92,7 @@ class ChecklistWindow(tk.Toplevel):
         tree.tk.call(tree, "heading", "#0", "state", "alternate")
         for key, label, width in (("step", "Adjustment", 360), ("result", "Result", 115)):
             tree.set_caption(key, tr(label))
-            tree.column(key, width=width, minwidth=40, stretch=key == "step", anchor="w" if key == "step" else "center")
+            tree.column(key, width=width, minwidth=40, anchor="w" if key == "step" else "center")
         for i in range(len(self.steps)):
             tree.insert("", "end", iid=str(i))
         grid_scrollable(tree)

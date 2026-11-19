@@ -1,3 +1,3 @@
 """Relf's semantic version."""
 
-__version__ = "0.34.3"
+__version__ = "0.37.0"

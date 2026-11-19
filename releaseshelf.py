@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import zipfile
@@ -40,7 +41,24 @@ def updates_disabled(job):
     return isinstance(job, Recipe) and job.updates_disabled
 
 
+def destination_preference_path():
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
+    return base / "Relf" / "destination.txt"
+
+
+def read_destination(setting):
+    try:
+        destination = Path(setting.read_text(encoding="utf-8-sig").strip())
+    except FileNotFoundError:
+        return None
+    if not destination.is_absolute():
+        raise ValueError(f"Use an absolute download folder in {setting}")
+    return destination
+
+
 def default_destination():
+    if destination := read_destination(destination_preference_path()):
+        return destination
     downloads = Path.home() / "Downloads"
     for name in ("PortableFetch", "ReleaseShelf"):
         legacy = downloads / name
