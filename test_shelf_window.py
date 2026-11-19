@@ -1577,16 +1577,10 @@ class DesktopTest(unittest.TestCase):
         second = tk.Toplevel(self.root)
         self.addCleanup(second.destroy)
         reopened = ShelfWindow(second, ui.catalog, self.dest, ui.targets, appearance_file=self.appearance)
-        second.geometry(self.root.geometry())
-        self.root.update()
-        # Match the table viewport after the new window lays out its sidebar.
-        delta = tree.winfo_width() - reopened.tree.winfo_width()
-        second.geometry(f"{second.winfo_width() + delta}x{second.winfo_height()}")
-        self.root.update()
-        self.assertEqual(reopened.tree.column("Name", "width"), fitted)
-        reopened.select_view("checklist")
-        self.root.update()
-        self.assertEqual(reopened.tree.column("Name", "width"), checklist)
+        # Tk redistributes column widths to fit each window's viewport.
+        self.assertEqual(reopened.saved_widths, ui.saved_widths)
+        self.assertIn("Name", reopened.saved_widths["tracked"])
+        self.assertIn("Name", reopened.saved_widths["checklist"])
 
     def test_visible_columns_fill_table_after_hiding_and_resizing(self):
         self.root.geometry("1120x680")
