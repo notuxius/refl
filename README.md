@@ -123,7 +123,7 @@ Set `shortcut` to a Start menu shortcut name, without the `.lnk` extension, to l
 
 For a publisher page, select **Add item → Source → Publisher page** and choose a unique item ID. If you change an existing recipe’s `id` by hand, keep its former IDs in the `previous_ids` array. Set the HTTPS `page`, a `version_pattern` with one capture group, and the HTTPS `download` URL. Use `filename` for a fixed archive name and `extract` for selected top-level ZIP members in publication order.
 
-Publisher recipes can use `{version}` in the download path, query, or archive filename. An optional `sha256_pattern` with one capture group reads the expected SHA-256 from the same release page. Relf verifies that digest before publishing the download. The optional Windows ISO resolver checks Microsoft's release and English x64 checksum during **Get updates**. When the app needs to download the image, it verifies the signature of the Fido PowerShell script and uses it to request a fresh Microsoft download link.
+Publisher recipes can use `{version}` in the download path, query, or archive filename. An optional `sha256_pattern` with one capture group reads the expected SHA-256 from the same release page. Relf verifies that digest before publishing the download. The optional Windows ISO resolver checks Microsoft's release and English x64 checksum during **Get updates**. When Relf needs to download the image, it verifies the signature of the Fido PowerShell script and uses it to request a fresh Microsoft download link.
 
 For a public GitHub repository with release assets, use this recipe shape and substitute the repository and its asset pattern:
 

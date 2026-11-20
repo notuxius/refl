@@ -2854,6 +2854,39 @@ class DesktopTest(unittest.TestCase):
                                   [f"https://publisher.example/{name}.iso" for name in names])
             self.assertEqual([self.ui.results[key].status for key in self.keys], ["Latest", "Cached"])
 
+    def test_update_all_counts_uncached_windows_iso_as_a_download(self):
+        image = GatedDownload()
+        checksum = hashlib.sha256(image.getvalue()).hexdigest()
+        release_page = f"version=25H2 sha256={checksum}"
+        windows_key, _ = self.keys
+        Path(windows_key).write_text(json.dumps({
+            "id": "test-image", "page": "https://www.microsoft.com/en-us/software-download/windows11",
+            "version_pattern": r"version=(\S+)", "sha256_pattern": r"sha256=(\S+)",
+            "download_resolver": "windows-11-english-x64", "filename": "image-{version}.iso",
+        }))
+        self.ui.reload()
+
+        response = GatedDownload()
+        with (
+            patch("fetch_sources.open_windows_iso", return_value=image) as microsoft_download,
+            patch("fetch_sources.read_page",
+                  side_effect=lambda url: "1" if url == "https://publisher.example" else release_page),
+            patch("fetch_sources.open_url", return_value=response) as download,
+        ):
+            self.ui.all_buttons["fetch"].invoke()
+            try:
+                self.wait_for(lambda: set(self.ui.transfers) == set(self.keys))
+                self.assertTrue(self.ui.status.get().endswith("of 2 downloads"), self.ui.status.get())
+            finally:
+                image.resume.set()
+                response.resume.set()
+                self.wait_until_idle()
+            self.assertEqual([self.ui.results[key].status for key in self.keys], ["Updated", "Updated"])
+            microsoft_download.assert_called_once_with("25H2", checksum)
+            download.assert_called_once_with("https://publisher.example/beta.bin")
+        installed = self.dest / "test-image" / "current" / "image-25H2.iso"
+        self.assertEqual(installed.read_bytes(), b"download")
+
     def test_fetch_displays_percentage_and_cached_fetch_keeps_progress_hidden(self):
         self.root.deiconify()
         self.ui.change_language("uk")
