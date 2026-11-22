@@ -206,6 +206,7 @@ class Recipe:
     updates_disabled: bool = False
     companions: CompanionActions = CompanionActions()
     direct_version: str = ""
+    iso_mirror: tuple[str, str] | None = None
 
     @classmethod
     def read(cls, path):
@@ -304,6 +305,12 @@ class Recipe:
                 if ("{asset}" in download) != has_asset:
                     raise ValueError("Use {asset} with a second capture group named asset.")
             archive = filename(data.get("filename", unquote(urlsplit(download).path.rsplit("/", 1)[-1])))
+        iso_mirror = None
+        if "iso_mirror" in data:
+            mirror = data["iso_mirror"]
+            if not resolver or not isinstance(mirror, dict) or not isinstance(mirror.get("url"), str):
+                raise ValueError("An ISO mirror requires the Windows 11 resolver, a URL, and a SHA-256 checksum.")
+            iso_mirror = (source_url(mirror["url"]), sha256(mirror.get("sha256")))
         if names and archive.casefold() == "files":
             raise ValueError("The archive filename conflicts with the extraction folder")
         job_id = filename(data["id"])
@@ -326,7 +333,8 @@ class Recipe:
                    checksum, publish_exe, previous_ids=previous_ids, sha256_pattern=checksum_pattern,
                    download_resolver=resolver, extract_folder=extract_folder, shortcut=shortcut,
                    apply_custom_settings=apply_settings, settings_files=settings, updates_disabled=updates_disabled,
-                   direct_version=direct_version, companions=companions, companion_dir=path.parent / "companions" / path.stem if path is not None else None, **metadata)
+                   direct_version=direct_version, companions=companions, iso_mirror=iso_mirror,
+                   companion_dir=path.parent / "companions" / path.stem if path is not None else None, **metadata)
 
     def id_keys(self):
         return tuple(dict.fromkeys(value.casefold() for value in (self.id, *self.previous_ids)))
@@ -358,6 +366,7 @@ class Recipe:
 
     def fingerprint(self, recipe_id=None):
         # Preserve the original fingerprint for unchanged page recipes and older manifests.
+        # An ISO mirror serves the release already identified by Microsoft's checksum.
         fields = {key: getattr(self, key) for key in
                   ("page", "version_pattern", "download", "archive", "extract")}
         fields["id"] = self.id if recipe_id is None else recipe_id
@@ -437,6 +446,8 @@ class Recipe:
                 if checksum and checksum != published:
                     raise ValueError("Publisher and recipe checksums disagree")
                 checksum = published
+            if self.iso_mirror and checksum == self.iso_mirror[1]:
+                download = self.iso_mirror[0]
             archive = filename(self.archive.replace("{version}", version).replace("{asset}", asset))
             if self.extract and archive.casefold() == "files":
                 raise ValueError("The archive filename conflicts with the extraction folder")
@@ -564,7 +575,7 @@ def download_chunks(recipe, release):
         if not mirror:
             raise ValueError("MajorGeeks did not provide a download link")
         download = mirror[1]
-    stream = (open_windows_iso(release.version, release.checksum) if recipe.download_resolver
+    stream = (open_windows_iso(release.version, release.checksum, download) if recipe.download_resolver
               else open_url(download))
     with stream as response:
         if release.modified and response.headers.get("Last-Modified") != release.modified:
@@ -659,7 +670,8 @@ def stage_release(recipe, release, folder, on_progress=None):
     size = archive.stat().st_size
     if not size or (expected is not None and size != expected):
         raise ValueError("Incomplete or empty download")
-    if release.checksum and digest(archive) != release.checksum:
+    archive_checksum = digest(archive)
+    if release.checksum and archive_checksum != release.checksum:
         raise ValueError(message("Publisher SHA-256 mismatch for {file}", file=release.archive))
     if recipe.extract_folder or (recipe.extract and archive.suffix.lower() != ".zip" and not zipfile.is_zipfile(archive)):
         extract_windows_archive(recipe, release, archive, folder / "files")
@@ -673,7 +685,7 @@ def stage_release(recipe, release, folder, on_progress=None):
                                 pass  # Reading to EOF validates this member's CRC.
                     except zipfile.BadZipFile as exc:
                         raise ValueError(message("Invalid ZIP checksum for {file}", file=member.filename)) from exc
-                return
+                return archive_checksum
             extracted = folder / "files"
             extracted.mkdir()
             entries = package.namelist()
@@ -689,3 +701,4 @@ def stage_release(recipe, release, folder, on_progress=None):
         if actual != expected:
             raise ValueError(message("{file} ProductVersion: expected {expected}, got {actual}",
                                      file=recipe.product_version, expected=expected, actual=actual))
+    return archive_checksum

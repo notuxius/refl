@@ -4,7 +4,7 @@ Relf is short for **Release Shelf**. It keeps portable Windows apps, archives, a
 
 Relf shows its version at the right end of the bottom status row.
 
-Batch checks and downloads run up to three items at a time. Each active download has a progress bar beneath **Downloading…** in its **Status** cell. The bottom status row shows one active transfer and its position, for example **2 of 4 downloads**. Items already up to date and files restored from a local copy are excluded. The bottom row and the open item info dialog also show the percentage received for the item they display. When the publisher does not provide a file size, the bars animate until the transfer finishes.
+Batch checks and downloads run up to three items at a time. A ready download can start while other publishers are still being checked. Each active download has a progress bar beneath **Downloading…** in its **Status** cell. The bottom status row shows one active transfer and its position. It adds the total download count once the checks are complete. The final summary counts outcomes such as updates, cached repairs, pending publications, errors, and cancellations. Items already up to date and files restored from a local copy are excluded. The bottom row and the open item info dialog also show the percentage received for the item they display. When the publisher does not provide a file size, the bars animate until the transfer finishes.
 
 ## Run it
 
@@ -32,7 +32,7 @@ Drag a divider to resize a column. Double-click it to fit the heading and the va
 
 Right-click any column header to show or hide columns in the app list. The menu lists every column in table order. Relf remembers your choices across views and restarts. At least one text column stays visible.
 
-Select **Item icon** in the column menu or **Show item icons** in Options to display the icon column before **Name**. ISO images show a CD icon. For Microsoft Store web installers, Relf looks up the product logo in the background and saves it for offline use. On Windows, Relf reads EXE icons and MSI product icons. For ZIPs, it tries the extracted app executable, then EXEs inside the archive from the shallowest folder first, then packaged ICO files. For an app without embedded artwork, place a 16 × 16 PNG in the app list’s `icons` subfolder with the same base filename as its recipe. Other rows use the Relf icon.
+Select **Item icon** in the column menu or **Show item icons** in Options to display the icon column before **Name**. ISO images show a CD icon. For Microsoft Store web installers, Relf looks up the product logo in the background and saves it for offline use. On Windows, Relf reads EXE, MSI, and ZIP icons in the background. For ZIPs, it tries the extracted app executable, then EXEs inside the archive from the shallowest folder first, then packaged ICO files. For an app without embedded artwork, place a 16 × 16 PNG in the app list’s `icons` subfolder with the same base filename as its recipe. Other rows use the Relf icon.
 
 **Update all items** compares publisher versions, downloads available updates, and repairs missing or damaged files across the app list, including items hidden by the current view or search. If an item encounters an update error, Relf retries after 1, 2, and 4 seconds before reporting the final error. The button changes to **Cancel** while the batch runs. Click it to stop the current operation and skip the remaining items. **More → Verify all items** checks the app list offline. To stop verification, reopen **More** and choose **Cancel**. Use **More → Reload** after changing recipe files externally.
 
@@ -123,7 +123,9 @@ Set `shortcut` to a Start menu shortcut name, without the `.lnk` extension, to l
 
 For a publisher page, select **Add item → Source → Publisher page** and choose a unique item ID. If you change an existing recipe’s `id` by hand, keep its former IDs in the `previous_ids` array. Set the HTTPS `page`, a `version_pattern` with one capture group, and the HTTPS `download` URL. Use `filename` for a fixed archive name and `extract` for selected top-level ZIP members in publication order.
 
-Publisher recipes can use `{version}` in the download path, query, or archive filename. An optional `sha256_pattern` with one capture group reads the expected SHA-256 from the same release page. Relf verifies that digest before publishing the download. The optional Windows ISO resolver checks Microsoft's release and English x64 checksum during **Get updates**. When Relf needs to download the image, it verifies the signature of the Fido PowerShell script and uses it to request a fresh Microsoft download link.
+Publisher recipes can use `{version}` in the download path, query, or archive filename. An optional `sha256_pattern` with one capture group reads the expected SHA-256 from the same release page. Relf verifies that digest before publishing the download. The optional Windows ISO resolver checks Microsoft's release and English x64 checksum during **Get updates**. For a Microsoft-hosted ISO, Relf verifies the signature of the Fido PowerShell script before using it to request a fresh download link.
+
+A local Windows 11 recipe can specify `iso_mirror` with `url` and `sha256` fields. Relf tries that URL only while Microsoft lists the same SHA-256 for the English x64 ISO. It verifies the downloaded image against Microsoft's checksum before publishing it and uses the Microsoft link resolver if the mirror cannot be reached or Microsoft lists a different image.
 
 For a public GitHub repository with release assets, use this recipe shape and substitute the repository and its asset pattern:
 

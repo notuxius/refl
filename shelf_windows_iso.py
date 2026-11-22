@@ -95,6 +95,8 @@ def windows_iso_url(version):
     if code == 20:
         raise ValueError("Fido publisher verification failed.")
     if code:
+        if "Sentinel marked this request as rejected" in output:
+            raise ValueError("Microsoft rejected the Windows ISO link request (Sentinel).")
         refusal = re.search(r"\b\d{3}-\d{6}\b", output)
         if refusal:
             raise ValueError(message("Microsoft refused the ISO download link (code {code}).", code=refusal[0]))
@@ -107,21 +109,31 @@ def windows_iso_url(version):
 
 
 @contextmanager
-def open_windows_iso(version, checksum):
-    """Stream the ISO from Microsoft's servers."""
+def open_windows_iso(version, checksum, mirror=""):
+    """Stream a checksum-pinned mirror or request a link from Microsoft."""
+    from fetch_sources import open_url
+
     check_canceled()
     if not isinstance(checksum, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", checksum):
         raise ValueError("Microsoft did not publish a valid English x64 ISO checksum.")
-
-    request = Request(windows_iso_url(version), headers={"User-Agent": f"Relf/{__version__}"})
-    check_canceled()
-    try:
-        response = build_opener(MicrosoftRedirect()).open(request, timeout=30)
-    except HTTPError as exc:
-        exc.close()
-        raise ValueError(message("Microsoft ISO download returned HTTP {status}.", status=exc.code)) from None
-    except URLError:
-        raise ValueError("Could not connect to the Microsoft ISO download server.") from None
+    response = None
+    if mirror:
+        try:
+            response = open_url(mirror)
+        except HTTPError as exc:
+            exc.close()
+        except URLError:
+            pass
+    if response is None:
+        request = Request(windows_iso_url(version), headers={"User-Agent": f"Relf/{__version__}"})
+        check_canceled()
+        try:
+            response = build_opener(MicrosoftRedirect()).open(request, timeout=30)
+        except HTTPError as exc:
+            exc.close()
+            raise ValueError(message("Microsoft ISO download returned HTTP {status}.", status=exc.code)) from None
+        except URLError:
+            raise ValueError("Could not connect to the Microsoft ISO download server.") from None
     with response:
         check_canceled()
         yield response

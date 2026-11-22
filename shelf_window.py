@@ -1,6 +1,7 @@
 """Relf desktop app."""
 
 import argparse
+from collections import Counter
 import ctypes
 import json
 from math import ceil
@@ -22,7 +23,7 @@ from recipe_editor import ACTIONS, ACTION_ICONS, RecipeEditor, save_recipe
 from releaseshelf import (ERRORS, MAX_PARALLEL_ITEMS, UPDATE_RETRY_DELAYS, ChecklistLoadError,
                           add_recipes_argument, batch_map, default_destination, destination_preference_path,
                           execute, load_targets, local_result, prepare_fetch, read_jobs, updates_disabled)
-from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, load_app_icon, store_product_id
+from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, run_icon_loader, store_product_id
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_checklist import Checklist, ChecklistHistory, LocalItem, catalog_item, run_checklist_step
 from shelf_checkboxes import checkbox_image, header_image
@@ -56,6 +57,8 @@ TRACKED_EXAMPLES = (
 WORKING = {"check": "Checking", "fetch": "Updating", "verify": "Verifying", "apply": "Applying"}
 RESULT_STATUSES = ("Unknown", "Pending", "Error", "Latest", "Updated", "Cached",
                    "Repair needed", "Update available", "Source error", "Verified", "Disabled", "Local only")
+SUMMARY_STATUSES = ("Updated", "Cached", "Latest", "Verified", "Applied",
+                    "Partially applied", "Update available", "Pending", "Repair needed", "Error")
 COLUMN_WIDTHS = {"Name": 126, "Category": 100, "Local version": 94,
                  "Available version": 115, "Status": 108, "Source": 110}
 SORTABLE_COLUMNS = ("Name", "Category", "Status")
@@ -162,35 +165,31 @@ def initial_result(job, dest, checklist_history):
 
 
 def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
-    def check(item):
+    def process(item):
         index, (key, job, cancel_event) = item
         events.put(("started", key, "check" if action == "fetch" else action, index))
-        if action == "fetch":
+        if action != "fetch":
+            result = execute(action, job, dest, targets, cancel_event=cancel_event)
+        else:
+            def retry():
+                events.put(("retry", key))
+
+            def progress(received, total):
+                events.put(("progress", key, received, total))
+
             result = prepare_fetch(job, dest, targets, cancel_event=cancel_event, retry_delays=retry_delays,
-                                   on_retry=lambda: events.put(("retry", key)))
+                                   on_retry=retry)
             if not isinstance(result, Result):
                 events.put(("prepared", key))
-                return key, result, cancel_event
-        else:
-            result = execute(action, job, dest, targets, cancel_event=cancel_event)
-        events.put(("result", key, result))
-
-    def download(item):
-        key, plan, cancel_event = item
-        events.put(("started", key, "fetch", None))
-
-        def progress(received, total):
-            events.put(("progress", key, received, total))
-
-        result = plan.run(on_progress=progress, cancel_event=cancel_event, on_retry=lambda: events.put(("retry", key)))
+                result = result.run(on_progress=progress, cancel_event=cancel_event, on_retry=retry)
         events.put(("result", key, result))
 
     try:
         targets = load_targets(targets_path, dest)
-        downloads = [plan for plan in batch_map(action, check, enumerate(items, 1)) if plan]
-        if downloads:
-            events.put(("downloads", tuple(key for key, _, _ in downloads)))
-            list(batch_map(action, download, downloads))
+        if action == "fetch":
+            dest.mkdir(parents=True, exist_ok=True)
+        for _ in batch_map(action, process, enumerate(items, 1)):
+            pass
     except Exception as exc:
         events.put(("failed", error_detail(exc)))
     finally:
@@ -253,6 +252,12 @@ class ShelfWindow:
             show_icons = False
         self.show_app_icons = tk.BooleanVar(root, value=show_icons)
         self.app_images = {}
+        self.icon_requests = {}
+        self.icon_tasks = Queue()
+        self.icon_results = Queue()
+        self.icon_stopped = Event()
+        self.icon_thread = None
+        self.icon_timer = None
         self.store_icon_queue = {}
         self.language_file = self.appearance_file.with_name("language.txt")
         self.language = read_language(self.language_file)
@@ -625,11 +630,13 @@ class ShelfWindow:
         if selected and selected[0] != self.view.get():
             self.select_view(selected[0])
 
-    def refresh_categories(self):
+    def refresh_categories(self, *, force=True):
         groups = {}
         for key, job in self.jobs.items():
             if isinstance(job, (Recipe, LocalItem)):
                 groups.setdefault("category:" + job.category, []).append(key)
+        if not force and groups == self.category_groups:
+            return
         self.category_groups = groups
         listing = self.category_list
         font = tkfont.Font(root=self.root, font=self.style.lookup(listing.cget("style"), "font"))
@@ -1111,9 +1118,17 @@ class ShelfWindow:
             style_titlebar(self.root, self.palette.is_dark)
 
     def on_destroy(self, event):
-        if event.widget is self.root and self.theme_timer is not None:
+        if event.widget is not self.root:
+            return
+        if self.theme_timer is not None:
             self.root.after_cancel(self.theme_timer)
             self.theme_timer = None
+        if self.icon_timer is not None:
+            self.root.after_cancel(self.icon_timer)
+            self.icon_timer = None
+        if self.icon_thread is not None:
+            self.icon_stopped.set()
+            self.icon_tasks.put(None)
 
     def open_options(self):
         if self.options is None:
@@ -1234,6 +1249,7 @@ class ShelfWindow:
 
     def set_app_icon(self, key):
         if isinstance(self.jobs[key], (Checklist, ChecklistLoadError)):
+            self.tree.item(key, image="")
             return  # Their first-column images come from the checklist tags.
         if key not in self.app_images:
             job = self.jobs[key]
@@ -1248,18 +1264,46 @@ class ShelfWindow:
                         self.store_icon_queue[product] = path
                         if len(self.store_icon_queue) == 1:
                             self.start_store_icon()
-            icon = icon or load_app_icon(self.root, job, self.dest)
+            self.app_images[key] = icon
             if icon is None and isinstance(job, (Recipe, LocalItem)):
                 artwork = self.catalog / "icons" / (Path(key).stem + ".png")
-                if artwork.is_file():
-                    try:
-                        icon = tk.PhotoImage(master=self.root, file=artwork, format="png")
-                        if (icon.width(), icon.height()) != (ICON_SIZE, ICON_SIZE):
-                            icon = None
-                    except tk.TclError:
-                        pass
-            self.app_images[key] = icon
+                token = self.icon_requests[key] = Event()
+                self.icon_tasks.put((key, token, job, self.dest, artwork))
+                if self.icon_thread is None:
+                    self.icon_thread = Thread(target=run_icon_loader,
+                                              args=(self.icon_tasks, self.icon_results, self.icon_stopped),
+                                              daemon=True, name="App icon loader")
+                    self.icon_thread.start()
+                if self.icon_timer is None:
+                    self.icon_timer = self.root.after(30, self.finish_app_icons)
         self.tree.item(key, image=self.app_images[key] or self.app_column_icon)
+
+    def finish_app_icons(self):
+        self.icon_timer = None
+        for _ in range(32):
+            try:
+                key, token, data = self.icon_results.get_nowait()
+            except Empty:
+                break
+            if self.icon_requests.get(key) is not token:
+                continue
+            del self.icon_requests[key]
+            if data is not None:
+                try:
+                    icon = tk.PhotoImage(master=self.root, data=data, format="png")
+                    if (icon.width(), icon.height()) == (ICON_SIZE, ICON_SIZE):
+                        self.app_images[key] = icon
+                        if self.show_app_icons.get():
+                            self.tree.item(key, image=icon)
+                except tk.TclError:
+                    pass
+        if self.icon_requests:
+            self.icon_timer = self.root.after(30, self.finish_app_icons)
+
+    def invalidate_app_icon(self, key):
+        if token := self.icon_requests.pop(key, None):
+            token.set()
+        self.app_images.pop(key, None)
 
     def start_store_icon(self):
         product = next(iter(self.store_icon_queue))
@@ -1279,6 +1323,7 @@ class ShelfWindow:
                 icon = tk.PhotoImage(master=self.root, data=data, format="png")
                 for key, job in self.jobs.items():
                     if store_product_id(job) == product:
+                        self.invalidate_app_icon(key)
                         self.app_images[key] = icon
                         if self.show_app_icons.get():
                             self.tree.item(key, image=icon)
@@ -1671,29 +1716,35 @@ class ShelfWindow:
             return
         previous = self.tree.selection()
         old_jobs, old_results = self.jobs, self.results
-        # Filtered rows stay in the tree as detached items.
-        if old_jobs:
-            self.tree.delete(*old_jobs)
-        self.app_images.clear()
+        removed = old_jobs.keys() - jobs.keys()
+        if removed:
+            self.tree.delete(*removed)
+        for key in removed:
+            self.invalidate_app_icon(key)
         self.jobs = jobs
         self.checked_items.intersection_update(key for key, job in jobs.items() if isinstance(job, Checklist))
         self.results = {}
         for key, job in self.jobs.items():
             previous_job = old_jobs.get(key)
-            if (keep_results and isinstance(previous_job, Recipe)
-                    and isinstance(job, Recipe) and previous_job.previous_ids == job.previous_ids
-                    and previous_job.fingerprint() == job.fingerprint()
-                    and previous_job.apply_custom_settings == job.apply_custom_settings
-                    and previous_job.settings_files == job.settings_files):
+            if (keep_results and isinstance(previous_job, Recipe) and isinstance(job, Recipe)
+                    and (previous_job == job or (
+                        previous_job.previous_ids == job.previous_ids
+                        and previous_job.fingerprint() == job.fingerprint()
+                        and previous_job.apply_custom_settings == job.apply_custom_settings
+                        and previous_job.settings_files == job.settings_files))):
                 self.results[key] = old_results[key]
             else:
                 self.results[key] = initial_result(job, self.dest, self.checklist_history)
-        for key in self.jobs:
-            self.tree.insert("", "end", iid=key)
-            self.paint(key)
-            if self.show_app_icons.get():
+        for key, job in self.jobs.items():
+            if key not in old_jobs:
+                self.tree.insert("", "end", iid=key)
+            if not keep_results or old_jobs.get(key) != job:
+                self.invalidate_app_icon(key)
+            if old_jobs.get(key) != job or old_results.get(key) != self.results[key]:
+                self.paint(key)
+            if self.show_app_icons.get() and key not in self.app_images:
                 self.set_app_icon(key)
-        self.refresh_categories()
+        self.refresh_categories(force=not keep_results)
         view = self.view.get()
         if ((view == "local" and not any(isinstance(job, LocalItem) for job in jobs.values()))
                 or (view == "disabled" and not any(updates_disabled(job) for job in jobs.values()))):
@@ -1878,11 +1929,15 @@ class ShelfWindow:
         action, index = self.active_items[key]
         name = self.name(key)
         if key in self.transfers:
-            remaining = sum(not self.cancel_events[key].is_set() for key in self.pending_downloads)
-            total = self.download_index + remaining
-            template = ("Downloading {name}  ·  {index} of {total} download" if total == 1 else
-                        "Downloading {name}  ·  {index} of {total} downloads")
-            self.set_status(template, name=name, index=index, total=total)
+            if self.unresolved_checks:
+                self.set_status("{action} {name}  ·  #{index}", action=message("Downloading"),
+                                name=name, index=index)
+            else:
+                remaining = sum(not self.cancel_events[key].is_set() for key in self.pending_downloads)
+                total = self.download_index + remaining
+                template = ("Downloading {name}  ·  {index} of {total} download" if total == 1 else
+                            "Downloading {name}  ·  {index} of {total} downloads")
+                self.set_status(template, name=name, index=index, total=total)
         elif action == "fetch":
             self.set_status("Updating {name}…", name=name)
         else:
@@ -1962,6 +2017,8 @@ class ShelfWindow:
         self.requested_action = "install" if install else action
         self.bulk_action = action if key is None else None
         self.total, self.finished, self.canceled, self.failure = len(keys), 0, 0, ""
+        self.batch_outcomes = Counter()
+        self.unresolved_checks = set(keys) if action == "fetch" else set()
         self.pending_downloads = set()
         self.download_index = 0
         if action == "fetch":
@@ -1999,16 +2056,16 @@ class ShelfWindow:
                 self.root.after(50, self.poll, action, label)
                 return
             status_changed = True
-            if event == "downloads":
-                self.pending_downloads = set(data[0])
-            elif event == "started":
+            if event == "started":
                 key, phase, index = data
                 self.active_items[key] = (phase, index)
                 self.paint(key)
                 view_changed = True
             elif event == "prepared":
                 key, = data
-                del self.active_items[key]
+                self.unresolved_checks.discard(key)
+                self.pending_downloads.add(key)
+                self.active_items[key] = ("fetch", None)
                 self.paint(key)
                 view_changed = True
             elif event == "retry":
@@ -2036,6 +2093,7 @@ class ShelfWindow:
                 self.retry_counts.pop(key, None)
                 self.transfers.pop(key, None)
                 self.pending_downloads.discard(key)
+                self.unresolved_checks.discard(key)
                 if key == self.install_key and self.cancel_events[key].is_set():
                     self.install_key = None
                 del self.cancel_events[key]
@@ -2046,8 +2104,9 @@ class ShelfWindow:
                 else:
                     self.results[key] = result
                     self.finished += 1
-                    if action == "fetch":
-                        self.app_images.pop(key, None)
+                    self.batch_outcomes["Error" if result.status == "Source error" else result.status] += 1
+                    if action == "fetch" and result.status in ("Updated", "Cached", "Pending"):
+                        self.invalidate_app_icon(key)
                         if self.show_app_icons.get():
                             self.set_app_icon(key)
                 self.paint(key)
@@ -2065,25 +2124,29 @@ class ShelfWindow:
                 self.busy = False
                 install_key, self.install_key = self.install_key, None
                 self.requested_action = self.bulk_action = None
+                unprocessed = tuple(self.cancel_events)
                 self.cancel_events.clear()
-                for key in self.jobs:
+                for key in unprocessed:
                     self.paint(key)
                 self.refresh_view(select_first=False)
                 if self.failure:
                     self.set_status("Could not finish: {error}", error=self.failure)
-                elif self.canceled:
-                    self.set_status("{label}  ·  {finished} of {total} processed, {canceled} canceled",
-                                    label=message(label), finished=self.finished, total=self.total,
-                                    canceled=self.canceled)
-                elif install_key is not None:
+                elif not self.canceled and install_key is not None:
                     result = self.results[install_key]
                     if result.status in ("Updated", "Cached", "Latest"):
                         self.open_installer(install_key)
                     else:
                         self.set_status("Could not finish: {error}", error=result.detail or message(result.status))
                 else:
-                    self.set_status("{label} finished  ·  {finished} of {total} processed", label=message(label),
-                                    finished=self.finished, total=self.total)
+                    template = ("{label}  ·  {finished} of {total} processed, {canceled} canceled" if self.canceled
+                                else "{label} finished  ·  {finished} of {total} processed")
+                    summary = message(template, label=message(label), finished=self.finished, total=self.total,
+                                      canceled=self.canceled)
+                    for status in SUMMARY_STATUSES:
+                        if count := self.batch_outcomes[status]:
+                            summary = message("{summary}  ·  {status}: {count}", summary=summary,
+                                              status=message(status), count=count)
+                    self.set_status(summary.template, **summary.params)
                 return
 
     def close(self):

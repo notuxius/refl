@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import ctypes
+from functools import cache, lru_cache
 from http.client import HTTPException
 import json
 import lzma
@@ -11,7 +12,6 @@ import shutil
 import struct
 import sys
 import tempfile
-import tkinter as tk
 from urllib.parse import urlsplit
 import zipfile
 import zlib
@@ -79,7 +79,7 @@ def _png_chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
 
-def _photo_from_backgrounds(master, black, white):
+def _png_from_backgrounds(black, white):
     # Comparing two backgrounds recovers coverage for both legacy AND-mask
     # icons and newer alpha-blended icons. PNG stores unpremultiplied RGBA.
     pixels = bytearray()
@@ -92,12 +92,11 @@ def _photo_from_backgrounds(master, black, white):
             red, green, blue = (min(255, round(channel * 255 / alpha)) for channel in (red, green, blue))
         pixels.extend((red, green, blue, alpha))
     header = struct.pack(">IIBBBBB", ICON_SIZE, ICON_SIZE, 8, 6, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", header)
-           + _png_chunk(b"IDAT", zlib.compress(pixels)) + _png_chunk(b"IEND", b""))
-    return tk.PhotoImage(master=master, data=png, format="png")
+    return (b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", header)
+            + _png_chunk(b"IDAT", zlib.compress(pixels)) + _png_chunk(b"IEND", b""))
 
 
-def _executable_icon(master, path):
+def _executable_icon(path):
     user = ctypes.windll.user32
     icon = ctypes.c_void_p()
     user.PrivateExtractIconsW(str(path), 0, ICON_SIZE, ICON_SIZE, ctypes.byref(icon), None, 1, 0)
@@ -128,14 +127,15 @@ def _executable_icon(master, path):
                 return None
             _gdi.GdiFlush()
             backgrounds.append(ctypes.string_at(bits, size))
-        return _photo_from_backgrounds(master, *backgrounds)
+        return _png_from_backgrounds(*backgrounds)
 
 
-def _disc_icon(master):
-    return tk.PhotoImage(master=master, file=Path(__file__).parent / "assets" / "disc.png")
+@cache
+def _disc_icon():
+    return (Path(__file__).parent / "assets" / "disc.png").read_bytes()
 
 
-def _msi_icon(master, path):
+def _msi_icon(path):
     # Open the installer database read-only and use the icon registered for Programs and Features.
     msi = ctypes.windll.msi
     db, view, record = (ctypes.c_uint() for _ in range(3))
@@ -160,10 +160,10 @@ def _msi_icon(master, path):
         folder = cleanup.enter_context(tempfile.TemporaryDirectory())
         icon_path = Path(folder) / ("product.exe" if raw[:2] == b"MZ" else "product.ico")
         icon_path.write_bytes(raw[:size.value])
-        return _executable_icon(master, icon_path)
+        return _executable_icon(icon_path)
 
 
-def _zip_icon(master, path):
+def _zip_icon(path):
     try:
         with zipfile.ZipFile(path) as package:
             members = [info for info in package.infolist() if info.filename.lower().endswith((".exe", ".ico"))]
@@ -179,7 +179,7 @@ def _zip_icon(master, path):
                             shutil.copyfileobj(src, dst)
                     except (zipfile.BadZipFile, EOFError, RuntimeError, OSError, zlib.error, lzma.LZMAError):
                         continue
-                    icon = _executable_icon(master, candidate)
+                    icon = _executable_icon(candidate)
                     if icon is not None:
                         return icon
     except (OSError, ValueError, zipfile.BadZipFile):
@@ -187,15 +187,21 @@ def _zip_icon(master, path):
     return None
 
 
-def load_app_icon(master, job, dest):
+@lru_cache(maxsize=512)
+def file_icon(path, metadata):
+    # A replaced executable or archive gets a new cache key.
+    loader = {".zip": _zip_icon, ".msi": _msi_icon, ".exe": _executable_icon}.get(path.suffix.lower())
+    return loader(path) if loader else None
+
+
+def load_app_icon(job, dest):
     try:
         if isinstance(job, LocalItem) and sys.platform == "win32" and not job.path.drive.startswith("\\\\"):
-            loader = {".zip": _zip_icon, ".msi": _msi_icon, ".exe": _executable_icon}.get(job.path.suffix.lower())
-            return loader(master, job.path) if loader else None
+            return file_icon(job.path, tuple(stamp(job.path)))
         if not isinstance(job, Recipe):
             return None
         if job.primary(job.archive or job.asset_pattern).lower().endswith(".iso"):
-            return _disc_icon(master)
+            return _disc_icon()
         if sys.platform != "win32" or dest.drive.startswith("\\\\"):
             return None
         root = job.cache_root(dest)
@@ -206,7 +212,7 @@ def load_app_icon(master, job, dest):
         archive = filename(state.get("archive", job.archive))
         primary = job.primary(archive)
         if primary.lower().endswith(".iso"):
-            return _disc_icon(master)
+            return _disc_icon()
         candidates = []
         published = state.get("published", {})
         published_path = Path(published.get("path", ""))
@@ -224,15 +230,25 @@ def load_app_icon(master, job, dest):
             if primary == archive and local_published:
                 candidates.append((published_path, archive, published.get("stat")))
         for path, member, recorded in candidates:
-            # Use recorded file metadata here. Hashing changed executables on the
-            # UI thread would make opening a large catalog unnecessarily slow.
-            if state["sha256"].get(member) and path.is_file() and (not recorded or recorded == stamp(path)):
-                if member.lower().endswith(".zip"):
-                    return _zip_icon(master, path)
-                loader = _msi_icon if member.lower().endswith(".msi") else _executable_icon
-                icon = loader(master, path)
-                if icon is not None:
-                    return icon
-    except (OSError, ValueError, TypeError, AttributeError, tk.TclError):
+            if state["sha256"].get(member) and path.is_file():
+                metadata = stamp(path)
+                if not recorded or recorded == metadata:
+                    if icon := file_icon(path, tuple(metadata)):
+                        return icon
+    except (OSError, ValueError, TypeError, AttributeError):
         pass  # A missing or unreadable local release can still be listed.
     return None
+
+
+def run_icon_loader(requests, results, stopped):
+    while (request := requests.get()) is not None and not stopped.is_set():
+        key, token, job, dest, artwork = request
+        if token.is_set():
+            continue
+        data = load_app_icon(job, dest)
+        if data is None and artwork is not None:
+            try:
+                data = artwork.read_bytes()
+            except OSError:
+                pass
+        results.put((key, token, data))

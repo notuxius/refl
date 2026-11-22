@@ -22,7 +22,7 @@ from shelf_text import FittedLabel
 from shelf_theme import WINDOW_SIDE_PADDING, category_picker, initial_geometry, style_titlebar
 
 
-PAGE_FIELDS = ("page", "version_pattern", "download", "download_resolver", "sha256_pattern")
+PAGE_FIELDS = ("page", "version_pattern", "download", "download_resolver", "sha256_pattern", "iso_mirror")
 GITHUB_FIELDS = ("github", "asset_pattern")
 SOURCE_FIELDS = {"Publisher page": PAGE_FIELDS, "GitHub release": GITHUB_FIELDS,
                  "Direct download": ("direct_download",), "Local file or folder": ("local_path",)}
@@ -429,6 +429,7 @@ class RecipeEditor(tk.Toplevel):
                 data["download_resolver"] = resolver
             else:
                 data.pop("download_resolver", None)
+                data.pop("iso_mirror", None)
                 required += ("download",)
             if pattern := self.fields["sha256_pattern"].get():
                 data["sha256_pattern"] = pattern

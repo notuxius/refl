@@ -1356,9 +1356,11 @@ class DesktopTest(unittest.TestCase):
 
     def test_app_icon_column_uses_the_heading_icon_for_missing_icons(self):
         local_icon = tk.PhotoImage(master=self.root, width=16, height=16)
+        data = local_icon.tk.call(str(local_icon), "data", "-format", "png")
         self.ui.show_app_icons.set(True)
-        with patch("shelf_window.load_app_icon", side_effect=(None, local_icon)):
+        with patch("shelf_app_icons.load_app_icon", side_effect=(None, data)):
             self.ui.change_app_icons()
+            self.wait_for(lambda: not self.ui.icon_requests)
         tree = self.ui.tree
         for mode, language in (("Light", "en"), ("Dark", "fr")):
             with self.subTest(mode=mode, language=language):
@@ -1370,7 +1372,8 @@ class DesktopTest(unittest.TestCase):
                 image, = tree.tk.splitlist(tree.heading("#0", "image"))
                 self.assertIn(image, self.root.image_names())
                 self.assertEqual(tree.item(self.keys[0], "image"), (image,))
-                self.assertEqual(tree.item(self.keys[1], "image"), (str(local_icon),))
+                self.assertEqual(tree.item(self.keys[1], "image"), (str(self.ui.app_images[self.keys[1]]),))
+                self.assertEqual(self.ui.app_images[self.keys[1]].data(format="png"), data)
                 self.assertEqual(tree.heading("Name", "text"), tr("Name"))
                 self.assertEqual(tree.set(self.keys[0], "Name"), "alpha")
                 self.assertEqual(tree.item(self.keys[0], "text"), "")
@@ -1394,17 +1397,21 @@ class DesktopTest(unittest.TestCase):
         }))
         Path(local_key).write_text(json.dumps({"id": "local", "local_path": str(archive)}))
         from shelf_app_icons import _executable_icon
-        expected = _executable_icon(self.root, Path(sys.executable))
-        self.assertIsNotNone(expected)
+        data = _executable_icon(Path(sys.executable))
+        self.assertIsNotNone(data)
+        expected = tk.PhotoImage(master=self.root, data=data, format="png")
         self.ui.show_app_icons.set(True)
         with patch("shelf_app_icons._executable_icon", wraps=_executable_icon) as extract:
             self.ui.reload()
-        self.assertEqual(extract.call_count, 4)
+            self.wait_for(lambda: not self.ui.icon_requests)
+            self.ui.reload()
+            self.wait_for(lambda: not self.ui.icon_requests)
+        self.assertEqual(extract.call_count, 2)
         for item in (key, local_key):
             icon = self.ui.app_images[item]
             self.assertEqual(icon.data(format="png"), expected.data(format="png"))
             self.assertEqual(self.ui.tree.item(item, "image"), (str(icon),))
-        self.assertFalse(any(call.args[1].exists() for call in extract.call_args_list))
+        self.assertFalse(any(call.args[0].exists() for call in extract.call_args_list))
 
     def test_catalog_icon_supplies_artwork_for_an_app_without_an_embedded_icon(self):
         key, other = self.keys
@@ -1416,6 +1423,7 @@ class DesktopTest(unittest.TestCase):
         (folder / (Path(other).stem + ".png")).write_bytes(b"incomplete PNG")
         self.ui.show_app_icons.set(True)
         self.ui.reload()
+        self.wait_for(lambda: not self.ui.icon_requests)
         self.assertEqual(self.ui.app_images[key].get(0, 0), (235, 52, 86))
         self.assertEqual(self.ui.tree.item(key, "image"), (str(self.ui.app_images[key]),))
         self.assertEqual(self.ui.tree.item(other, "image"), (str(self.ui.app_column_icon),))
@@ -1428,8 +1436,7 @@ class DesktopTest(unittest.TestCase):
         with zipfile.ZipFile(archive, "w") as package:
             package.write(source, "resources/app.ico")
             package.writestr("start.cmd", "echo ready")
-        icon = _zip_icon(self.root, archive)
-        self.assertEqual(icon.data(format="png"), _executable_icon(self.root, source).data(format="png"))
+        self.assertEqual(_zip_icon(archive), _executable_icon(source))
 
     def test_iso_recipes_show_disc_icons_before_download(self):
         for key, source in zip(self.keys, (
@@ -1441,6 +1448,7 @@ class DesktopTest(unittest.TestCase):
         self.ui.reload()
         self.ui.options_button.invoke()
         self.ui.options.app_icons_button.invoke()
+        self.wait_for(lambda: not self.ui.icon_requests)
 
         for key in self.keys:
             icon = self.ui.app_images[key]
@@ -2791,6 +2799,46 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual((self.dest / "alpha" / "current" / "alpha.bin").read_bytes(), b"fixture")
         self.assertEqual(beta.status, "Error")
         self.assertIn("Transfer failed on download 4", beta.detail)
+        self.assertIn("Updated: 1", self.ui.status.get())
+        self.assertIn("Error: 1", self.ui.status.get())
+
+    def test_ready_download_does_not_wait_for_other_publishers(self):
+        from fetch_sources import Recipe
+
+        slow = GatedPage()
+        response = GatedDownload()
+        resolve = Recipe.resolve
+
+        def check(job):
+            if job.id == "beta":
+                slow()
+            return resolve(job)
+
+        with (patch.object(Recipe, "resolve", check),
+              patch("fetch_sources.read_page", return_value="1"),
+              patch("fetch_sources.open_url", side_effect=lambda url:
+                    response if url.endswith("/alpha.bin") else download_fixture(url))):
+            self.ui.all_buttons["fetch"].invoke()
+            try:
+                self.wait_for(lambda: slow.entered.is_set() and self.keys[0] in self.ui.transfers)
+                self.assertEqual(self.ui.active_items[self.keys[1]][0], "check")
+                self.assertIn("·  #1", self.ui.status.get())
+            finally:
+                slow.resume.set()
+                response.resume.set()
+                self.wait_until_idle()
+        self.assertEqual([self.ui.results[key].status for key in self.keys], ["Updated", "Updated"])
+
+    def test_saving_one_recipe_repaints_only_its_row(self):
+        path = Path(self.keys[1])
+        data = json.loads(path.read_bytes())
+        data["name"] = "New name"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with patch.object(self.ui, "paint", wraps=self.ui.paint) as paint:
+            self.ui.recipe_saved(path)
+        paint.assert_called_once_with(str(path))
+        self.assertEqual(self.ui.tree.selection(), (str(path),))
+        self.assertEqual(self.ui.tree.set(str(path), "Name"), "New name")
 
     def test_cancel_update_all_during_retry_wait(self):
         with (patch("shelf_window.UPDATE_RETRY_DELAYS", (60, 60, 60)),
@@ -2839,7 +2887,7 @@ class DesktopTest(unittest.TestCase):
                     self.assertEqual(self.ui.tree.set(queued, "Status"), "Pending")
                     self.assertEqual(self.ui.view_counts["attention"].get(), "0")
                     self.assertEqual({Path(key).stem for key in self.ui.tree.get_children()}, set(names[:3]))
-                    self.assertIn("1 of 4 downloads", self.ui.status.get())
+                    self.assertIn("·  #1", self.ui.status.get())
                     responses["delta"].resume.set()
                     self.wait_for(lambda: responses["gamma"].waiting.is_set() and
                                   {Path(key).stem for key in self.ui.transfers} == {"amber", "epsilon", "gamma"})
@@ -2853,6 +2901,8 @@ class DesktopTest(unittest.TestCase):
             self.assertCountEqual([call.args[0] for call in download.call_args_list],
                                   [f"https://publisher.example/{name}.iso" for name in names])
             self.assertEqual([self.ui.results[key].status for key in self.keys], ["Latest", "Cached"])
+            for summary in ("Updated: 4", "Latest: 1", "Cached: 1"):
+                self.assertIn(summary, self.ui.status.get())
 
     def test_update_all_counts_uncached_windows_iso_as_a_download(self):
         image = GatedDownload()
@@ -2882,7 +2932,7 @@ class DesktopTest(unittest.TestCase):
                 response.resume.set()
                 self.wait_until_idle()
             self.assertEqual([self.ui.results[key].status for key in self.keys], ["Updated", "Updated"])
-            microsoft_download.assert_called_once_with("25H2", checksum)
+            microsoft_download.assert_called_once_with("25H2", checksum, "")
             download.assert_called_once_with("https://publisher.example/beta.bin")
         installed = self.dest / "test-image" / "current" / "image-25H2.iso"
         self.assertEqual(installed.read_bytes(), b"download")
@@ -3538,13 +3588,13 @@ class DesktopTest(unittest.TestCase):
 
     def test_keyboard_search_clear_and_open_catalog_tab(self):
         self.root.deiconify()
+        self.root.update()
         tree = self.ui.tree
         tree.focus_force()
-        self.root.update()
+        self.wait_for(lambda: self.root.focus_get() is tree)
         tree.event_generate("<Control-f>")
-        self.root.update()
         entry = self.ui.search_entry
-        self.assertEqual(self.root.focus_get(), entry)
+        self.wait_for(lambda: self.root.focus_get() is entry)
         entry.insert(0, "beta")
         self.root.update()
         self.assertEqual(tree.get_children(), (self.keys[1],))
@@ -3839,6 +3889,9 @@ class DesktopTest(unittest.TestCase):
         saved = json.loads(path.read_text())
         self.assertNotIn("download", saved)
         self.assertEqual(saved["download_resolver"], "windows-11-english-x64")
+        saved["iso_mirror"] = {"url": "https://mirror.example/image.iso", "sha256": "a" * 64}
+        path.write_text(json.dumps(saved))
+        self.ui.reload()
 
         editor = self.edit_selected()
         self.assertFalse(editor.raw_editor)
@@ -3855,6 +3908,7 @@ class DesktopTest(unittest.TestCase):
         editor.save()
         saved = json.loads(path.read_text())
         self.assertNotIn("download_resolver", saved)
+        self.assertNotIn("iso_mirror", saved)
         self.assertEqual(saved["download"], download)
         self.assertEqual(saved["filename"], "Windows 11 {version}.iso")
         self.assertEqual(saved["sha256_pattern"], pattern)
@@ -3870,6 +3924,7 @@ class DesktopTest(unittest.TestCase):
         del data["download"]
         data.update(page="https://www.microsoft.com/en-us/software-download/windows11",
                     download_resolver="windows-11-english-x64", sha256_pattern=r"English x64 (\w{64})",
+                    iso_mirror={"url": "https://mirror.example/image.iso", "sha256": "b" * 64},
                     filename="image.iso")
         path.write_text(json.dumps(data))
         self.ui.reload()

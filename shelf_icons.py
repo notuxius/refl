@@ -36,7 +36,7 @@ def category_icon(category):
     return "folder"
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=128)
 def tinted_strip(filename, color):
     # The indexed PNG stores line coverage in its transparency table. Tinting
     # its single palette preserves antialiasing against any background.
@@ -50,14 +50,16 @@ def tinted_strip(filename, color):
 
 def make_icon(master, name, color, size=16):
     y, cell_width = {16: (0, 20), 20: (16, 20), 28: (36, 28)}[size]
-    x = NAMES.index(name) * cell_width
-    # Share decoded strips across widgets in the same Tk interpreter.
+    # Each tile is aligned to both cell widths, so no icon crosses a tile boundary.
+    tile, x = divmod(NAMES.index(name) * cell_width, 140)
     root = master._root()
-    if not hasattr(root, "_command_strips"):
-        root._command_strips = {}
-    if color not in root._command_strips:
-        root._command_strips[color] = tk.PhotoImage(master=root, data=tinted_strip("commands.png", color), format="png")
-    strip = root._command_strips[color]
+    if not hasattr(root, "_command_tiles"):
+        root._command_tiles = {}
+    key = (tile, color)
+    if key not in root._command_tiles:
+        atlas = tinted_strip(f"commands/{tile}.png", color)
+        root._command_tiles[key] = tk.PhotoImage(master=root, data=atlas, format="png")
+    strip = root._command_tiles[key]
     icon = tk.PhotoImage(master=master, width=size, height=size)
     icon.tk.call(str(icon), "copy", str(strip), "-from", x, y, x + size, y + size)
     return icon

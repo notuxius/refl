@@ -845,7 +845,7 @@ class RelfTest(unittest.TestCase):
             self.assertEqual(execute("check", recipe, self.dest, {}).status, "Update available")
             open_iso.assert_not_called()
             self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Updated")
-            open_iso.assert_called_once_with("26H2", checksum)
+            open_iso.assert_called_once_with("26H2", checksum, "")
             self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Latest")
             self.assertEqual(execute("verify", recipe, self.dest, {}).status, "Verified")
             state = json.loads((self.dest / recipe.id / "current.json").read_text())
@@ -855,6 +855,52 @@ class RelfTest(unittest.TestCase):
             self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Cached")
             open_iso.assert_called_once()
             ordinary_download.assert_not_called()
+
+    def test_windows_iso_mirror_requires_a_matching_publisher_checksum(self):
+        data = {
+            "id": "test-image", "page": "https://www.microsoft.com/en-us/software-download/windows11",
+            "version_pattern": r"version=(\S+)", "sha256_pattern": r"sha256=(\S+)",
+            "download_resolver": "windows-11-english-x64", "filename": "image-{version}.iso",
+        }
+        payload = b"retail ISO fixture"
+        checksum = hashlib.sha256(payload).hexdigest()
+        mirror = "https://mirror.example/retail.iso"
+        recipe = Recipe.from_data({**data, "iso_mirror": {"url": mirror, "sha256": checksum}})
+        self.assertEqual(recipe.fingerprint(), Recipe.from_data(data).fingerprint())
+        with patch("fetch_sources.read_page", return_value=f"version=26H2 sha256={'0' * 64}"):
+            self.assertEqual(recipe.resolve().download, "")
+
+        wrong = io.BytesIO(b"wrong ISO")
+        wrong.headers = {}
+        valid = io.BytesIO(payload)
+        valid.headers = {"Content-Length": str(len(payload))}
+        with (patch("fetch_sources.read_page", return_value=f"version=26H2 sha256={checksum}"),
+              patch("fetch_sources.open_url", side_effect=[wrong, valid]) as download,
+              patch("shelf_windows_iso.windows_iso_url") as microsoft):
+            self.assertEqual(execute("check", recipe, self.dest, {}).status, "Update available")
+            download.assert_not_called()
+            rejected = execute("fetch", recipe, self.dest, {})
+            self.assertIn("SHA-256 mismatch", rejected.detail)
+            self.assertFalse((self.dest / recipe.id / "current.json").exists())
+            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Updated")
+            self.assertEqual(execute("verify", recipe, self.dest, {}).status, "Verified")
+            self.assertEqual([call.args for call in download.call_args_list], [(mirror,), (mirror,)])
+            microsoft.assert_not_called()
+
+    def test_windows_iso_uses_microsoft_if_the_mirror_is_unavailable(self):
+        from shelf_windows_iso import open_windows_iso
+
+        mirror = "https://mirror.example/retail.iso"
+        unavailable = HTTPError(mirror, 503, "Unavailable", Message(), io.BytesIO())
+        url = "https://software.download.prss.microsoft.com/retail.iso"
+        with (patch("fetch_sources.open_url", side_effect=unavailable),
+              patch("shelf_windows_iso.windows_iso_url", return_value=url),
+              patch("shelf_windows_iso.build_opener") as opener):
+            opener.return_value.open.return_value = io.BytesIO(b"Microsoft ISO")
+            with open_windows_iso("26H2", "a" * 64, mirror) as response:
+                self.assertEqual(response.read(), b"Microsoft ISO")
+            self.assertEqual(opener.return_value.open.call_args.args[0].full_url, url)
+            self.assertTrue(unavailable.fp.closed)
 
     def test_adopt_original_manifest_and_repair_live_file_without_downloading(self):
         self.cli("fetch")
@@ -888,6 +934,30 @@ class RelfTest(unittest.TestCase):
         self.assertEqual(self.requests, before)
         self.cli("fetch")
         self.assertIn("Verified: 1.27", self.cli("verify"))
+
+    def test_fetch_hashes_an_archive_once_per_stage(self):
+        data = self.archive.read_bytes()
+        raw = {**self.recipe, "sha256": hashlib.sha256(data).hexdigest()}
+        del raw["extract"]
+        recipe = Recipe.from_data(raw)
+        response = io.BytesIO(data)
+        response.headers = {"Content-Length": str(len(data))}
+        with (patch("fetch_sources.read_page", return_value="SampleTool v1.27"),
+              patch("fetch_sources.open_url", return_value=response) as publisher,
+              patch("fetch_sources.digest", wraps=digest) as downloaded_hash,
+              patch("fetch_store.digest", wraps=digest) as local_hash):
+            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Updated")
+            downloaded_hash.assert_called_once()
+            local_hash.assert_called_once()  # Read back the staged publication.
+            state = json.loads(self.manifest.read_text())
+            self.assertEqual(state["sha256"][recipe.archive], raw["sha256"])
+
+            Path(state["published"]["path"]).unlink()
+            local_hash.reset_mock()
+            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Cached")
+            self.assertEqual(local_hash.call_count, 2)  # Cached archive and staged publication.
+            publisher.assert_called_once()
+            self.assertEqual(execute("verify", recipe, self.dest, {}).status, "Verified")
 
     @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
     def test_locked_custom_target_retries_cached_release(self):

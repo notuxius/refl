@@ -333,13 +333,14 @@ def download(root, recipe, release, on_progress=None):
         folder = Path(temp) / "payload"
         folder.mkdir()
         members = recipe.versioned_members(release.version)
-        stage_release(members, release, folder, on_progress)
+        archive_checksum = stage_release(members, release, folder, on_progress)
         names = members.expected_files(release.archive)
         if recipe.extract_folder:
             names = [release.archive, *(p.relative_to(folder).as_posix() for p in
                                         (folder / "files").rglob("*") if p.is_file())]
         state = {"version": release.version, "release": release_id, "recipe": recipe.fingerprint(),
-                 "archive": release.archive, "sha256": {name: digest(folder / name) for name in names},
+                 "archive": release.archive, "sha256": {
+                     name: archive_checksum if name == release.archive else digest(folder / name) for name in names},
                  "stats": {name: stamp(folder / name) for name in names}}
         if release.modified:
             state["modified"] = release.modified
@@ -493,7 +494,8 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     local = state["version"] if state else "-"
     output = Output.for_release(root, recipe.versioned_members(release.version), release.archive, override, state or pending)
     same = matches(state, recipe, release)
-    issue = cache_issue(root, recipe, state, release.archive, action == "fetch") if same else ""
+    cached_issue = cache_issue(root, recipe, state, release.archive, action == "fetch") if same else None
+    issue = cached_issue or ""
     if same and not issue:
         issue = output.issue(state, action == "fetch")
         if not issue and pending is None:
@@ -513,10 +515,14 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
         return Result("Repair needed" if same else "Update available", local, release.version, reason)
 
     candidate = None
-    for entry in (pending, state):
-        if matches(entry, recipe, release) and not cache_issue(root, recipe, entry, release.archive, True):
-            candidate = entry.copy()
-            break
+    if matches(pending, recipe, release):
+        pending_issue = (cached_issue if same and pending["release"] == state["release"]
+                         and pending["sha256"] == state["sha256"]
+                         else cache_issue(root, recipe, pending, release.archive, True))
+        if not pending_issue:
+            candidate = pending.copy()
+    if candidate is None and same and not cached_issue:
+        candidate = state.copy()
     if candidate is None:
         if defer_download:
             return release
