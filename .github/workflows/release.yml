@@ -41,10 +41,7 @@ jobs:
         run: python -m PyInstaller --noconfirm Relf.spec
       - name: Push release tag
         if: github.event_name == 'workflow_dispatch'
-        run: |
-          git tag $env:RELEASE_TAG $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git push origin "refs/tags/$env:RELEASE_TAG"
+        run: 'git push origin "${env:GITHUB_SHA}:refs/tags/$env:RELEASE_TAG"'
       - name: Publish executable
         env:
           GH_TOKEN: ${{ github.token }}
