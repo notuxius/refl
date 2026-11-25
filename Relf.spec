@@ -22,6 +22,7 @@ metadata = VSVersionInfo(
 
 app = Analysis([str(root / 'relf_ui.pyw')], datas=[
     (str(root / 'assets'), 'assets'), (str(root / 'locales' / '*.json'), 'locales'),
+    (str(root / 'replace_relf.ps1'), '.'),
 ])
 exe = EXE(
     PYZ(app.pure), app.scripts, app.binaries, app.datas, [],

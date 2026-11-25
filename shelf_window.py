@@ -42,6 +42,7 @@ from shelf_text import CELL_TEXT_INSETS, TK_CELL_INSETS, FittedLabel, FittedTree
 from shelf_theme import (ARROW_DOWN, ARROW_UP, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
                         preference_path, read_appearance, style_titlebar, style_widgets, system_mode,
                         work_area, write_appearance, write_preference)
+from shelf_update import check_for_update, finish_relaunch, prepare_update, relf_executable
 from shelf_version import __version__
 
 
@@ -70,6 +71,7 @@ SORTABLE_COLUMNS = ("Name", "Category", "Status")
 SEARCH_CHAR_LIMIT = 64
 INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle"}
 ASSETS = Path(__file__).resolve().parent / "assets"
+CHECK_RELF_UPDATES = "Check for Relf updates"
 
 
 DELETE_ICONS = {DELETE: "close", FOLDER: "folder_x"}
@@ -118,6 +120,53 @@ def deletion_dialog(parent, palette, mode, name, detail, paths=(), *, blocked=Fa
                             style="Primary.TButton", command=accept)
         delete.pack(side="left", padx=(8, 0))
         delete.bind("<Return>", lambda _: delete.invoke())
+    dialog.bind("<Escape>", lambda _: dialog.destroy())
+    initial_geometry(dialog, 0, 0, parent=parent)
+    style_titlebar(dialog, palette.is_dark)
+    dialog.grab_set()
+    cancel.focus_set()
+    show_window(dialog)
+    parent.wait_window(dialog)
+    return confirmed
+
+
+def confirm_relf_update(parent, palette, update):
+    dialog = tk.Toplevel(parent)
+    stage_window(dialog)
+    dialog.transient(parent)
+    dialog.title(tr("Relf update available"))
+    body = ttk.Frame(dialog, padding=16)
+    body.pack(fill="both", expand=True)
+    body.columnconfigure(0, weight=1)
+    heading = tr("Relf v{version} is available", version=update.version)
+    ttk.Label(body, text=heading, font=("Segoe UI Semibold", 13)).grid(sticky="w")
+    ttk.Label(body, text=tr("Installed version: v{version}", version=__version__)).grid(sticky="w", pady=(4, 10))
+    if update.notes.strip():
+        body.rowconfigure(2, weight=1)
+        panel = ttk.Frame(body, style="Surface.TFrame", padding=1)
+        panel.grid(row=2, sticky="nsew")
+        notes = tk.Text(panel, width=58, height=12, wrap="word", font=("Segoe UI", 10),
+                        padx=8, pady=6, relief="flat", borderwidth=0,
+                        background=palette.surface, foreground=palette.text,
+                        selectbackground=palette.selection, selectforeground=palette.text)
+        notes.insert("1.0", update.notes)
+        notes.configure(state="disabled")
+        grid_scrollable(notes)
+    actions = ttk.Frame(body)
+    actions.grid(row=3, sticky="e", pady=(10, 0))
+    confirmed = False
+
+    def accept():
+        nonlocal confirmed
+        confirmed = True
+        dialog.destroy()
+
+    cancel = ttk.Button(actions, text=tr("Cancel"), command=dialog.destroy)
+    cancel.pack(side="left")
+    install = ttk.Button(actions, text=tr("Update and restart"), style="Primary.TButton", command=accept)
+    install.pack(side="left", padx=(8, 0))
+    cancel.bind("<Return>", lambda _: cancel.invoke())
+    install.bind("<Return>", lambda _: install.invoke())
     dialog.bind("<Escape>", lambda _: dialog.destroy())
     initial_geometry(dialog, 0, 0, parent=parent)
     style_titlebar(dialog, palette.is_dark)
@@ -254,6 +303,9 @@ class ShelfWindow:
         self.options = None
         self.events = Queue()
         self.publication_timer = None
+        self.relf_update_timer = None
+        self.relf_checking = self.relf_check_manual = False
+        self.relf_update = None
         root.title("Relf")
         if sys.platform == "win32":
             root.iconbitmap(default=str(ASSETS / "relf.ico"))
@@ -828,6 +880,7 @@ class ShelfWindow:
         self.more_menu = DropdownMenu(self.more_button)
         self.more_menu.add_action("Reload", self.reload, icon="reload")
         self.more_menu.add_action(ALL_ACTIONS["verify"], lambda: self.bulk_command("verify"), icon="verify")
+        self.more_menu.add_action(CHECK_RELF_UPDATES, self.check_relf_updates, icon="download")
         self.bulk_buttons = {**self.all_buttons, "verify": self.more_menu.buttons[ALL_ACTIONS["verify"]]}
         self.more_button.pack(side="left")
 
@@ -1124,8 +1177,12 @@ class ShelfWindow:
         self.download_progress = DownloadProgress(footer)
         self.download_progress.grid(row=0, column=3, padx=(12, 0))
         self.download_progress.grid_remove()
-        ttk.Label(footer, text=f"v{__version__}", style="Small.TLabel").grid(row=0, column=4, padx=(12, 0))
-        ttk.Sizegrip(footer).grid(row=0, column=5, padx=(4, 0), sticky="se")
+        self.relf_update_button = ttk.Button(footer, text=tr("Relf update available"),
+                                            style="Command.TButton", command=self.offer_relf_update)
+        self.relf_update_button.grid(row=0, column=4, padx=(12, 0))
+        self.relf_update_button.grid_remove()
+        ttk.Label(footer, text=f"v{__version__}", style="Small.TLabel").grid(row=0, column=5, padx=(12, 0))
+        ttk.Sizegrip(footer).grid(row=0, column=6, padx=(4, 0), sticky="se")
         status_label = FittedLabel(footer, anchor="w", style="Small.TLabel")
         status_label.grid(row=0, column=2, sticky="ew")
         self.status.trace_add("write", lambda *_: status_label.set_text(self.status.get()))
@@ -1133,6 +1190,88 @@ class ShelfWindow:
     def set_status(self, template, **values):
         self.status_message = message(template, **values)
         self.status.set(tr(self.status_message))
+
+    def run_relf_update_task(self, task, finish):
+        result = Queue()
+
+        def work():
+            try:
+                result.put((task(), None))
+            except ERRORS as exc:
+                result.put((None, error_detail(exc)))
+
+        def poll():
+            try:
+                value, error = result.get_nowait()
+            except Empty:
+                self.relf_update_timer = self.root.after(50, poll)
+                return
+            self.relf_update_timer = None
+            finish(value, error)
+
+        Thread(target=work, daemon=True).start()
+        self.relf_update_timer = self.root.after(50, poll)
+
+    def check_relf_updates(self, *, manual=True):
+        if self.busy:
+            return
+        if relf_executable() is None:
+            if manual:
+                self.set_status("Self-updates are available in the Windows Relf executable.")
+            return
+        if manual:
+            self.relf_check_manual = True
+            self.set_status("Checking for Relf updates…")
+        if not self.relf_checking:
+            self.relf_checking = True
+            self.run_relf_update_task(check_for_update, self.finish_relf_check)
+
+    def finish_relf_check(self, update, error):
+        manual = self.relf_check_manual
+        self.relf_checking = self.relf_check_manual = False
+        if error is not None:
+            if manual and not self.busy:
+                self.set_status("Could not check for Relf updates: {error}", error=error)
+            return
+        self.relf_update = update
+        if update is None:
+            self.relf_update_button.grid_remove()
+            if manual and not self.busy:
+                self.set_status("Relf is up to date.")
+        else:
+            self.relf_update_button.grid()
+            if manual and not self.busy:
+                self.set_status("Relf update available")
+                self.offer_relf_update()
+
+    def offer_relf_update(self):
+        if self.busy or self.relf_update is None:
+            return
+        if self.relf_checking:
+            self.relf_check_manual = True
+            return
+        if self.installing or self.editor is not None:
+            self.set_status("Close the item editor and let any installs finish before updating Relf.")
+            return
+        executable = relf_executable()
+        update = self.relf_update
+        self.busy = True
+        self.controls()
+        if not confirm_relf_update(self.root, self.palette, update):
+            self.busy = False
+            self.controls()
+            return
+        self.set_status("Downloading Relf v{version}…", version=update.version)
+        self.run_relf_update_task(lambda: prepare_update(executable, update), self.finish_relf_install)
+
+    def finish_relf_install(self, helper, error):
+        self.busy = False
+        if error is None:
+            self.relf_update_helper = helper
+            self.close()
+        else:
+            self.set_status("Could not update Relf: {error}", error=error)
+            self.controls()
 
     def on_map(self, event):
         if event.widget is self.root and self.palette is not None:
@@ -1150,6 +1289,9 @@ class ShelfWindow:
         if self.publication_timer is not None:
             self.root.after_cancel(self.publication_timer)
             self.publication_timer = None
+        if self.relf_update_timer is not None:
+            self.root.after_cancel(self.relf_update_timer)
+            self.relf_update_timer = None
         if self.icon_thread is not None:
             self.icon_stopped.set()
             self.icon_tasks.put(None)
@@ -1190,6 +1332,7 @@ class ShelfWindow:
     def refresh_labels(self):
         for button in self.sidebar_labels:
             self.fit_sidebar_button(button)
+        self.relf_update_button.configure(text=tr("Relf update available"))
         for widget, label in self.captions.items():
             widget.configure(text=tr(label))
         self.update_search_hint()
@@ -2096,6 +2239,8 @@ class ShelfWindow:
         selected_state = "disabled" if self.busy or not self.tree.selection() else "normal"
         idle_state = "disabled" if self.busy else "normal"
         self.more_menu.buttons["Reload"].configure(state=idle_state)
+        self.more_menu.buttons[CHECK_RELF_UPDATES].configure(state=idle_state)
+        self.relf_update_button.configure(state=idle_state)
         self.more_button.configure(state="normal" if self.bulk_action == "verify" else idle_state)
         self.more_menu.sync_arrow()
         self.add_button.configure(state=idle_state)
@@ -2319,6 +2464,12 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Relf.Desktop")
     root = tk.Tk()
     stage_window(root)
-    ShelfWindow(root, args.recipes.resolve(), dest, args.targets or dest / "targets.json")
+    window = ShelfWindow(root, args.recipes.resolve(), dest, args.targets or dest / "targets.json")
     show_window(root)
+    try:
+        if failure := finish_relaunch():
+            window.set_status("Could not update Relf: {error}", error=failure)
+    except OSError as exc:
+        window.set_status("Could not confirm the Relf update: {error}", error=error_detail(exc))
+    window.check_relf_updates(manual=False)
     root.mainloop()
