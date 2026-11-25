@@ -12,7 +12,7 @@ import sys
 import tempfile
 from string import Formatter
 from threading import Event
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 import tkinter as tk
 from tkinter import ttk
 import unittest
@@ -20,7 +20,7 @@ from unittest.mock import patch
 import zipfile
 
 from fetch_store import Result
-from releaseshelf import default_destination, destination_preference_path
+from releaseshelf import GITHUB_PAUSED, default_destination, destination_preference_path
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_delete import DELETE, FOLDER, delete_item, deletion_plan
 from shelf_checkboxes import header_image
@@ -111,7 +111,7 @@ class DesktopTest(unittest.TestCase):
             tabs.select(next(tab for tab in tabs.tabs() if tabs.tab(tab, "text") == tr(tab_name)))
         return editor
 
-    def right_click_app(self, key, *, cancel_for=None):
+    def right_click_app(self, key, *, cancel_for=None, install_label="Install"):
         self.root.deiconify()
         self.root.update()
         tree = self.ui.tree
@@ -122,7 +122,7 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(menu.winfo_viewable())
         toggle = "Enable updates" if getattr(self.ui.jobs[key], "updates_disabled", False) else "Disable updates"
         labels = ("Get updates", "Verify files", toggle,
-                  "Install", "Open app folder", MOVE, "Edit item", DELETE, FOLDER)
+                  install_label, "Open app folder", MOVE, "Edit item", DELETE, FOLDER)
         self.assertEqual([button.cget("text") for button in menu.buttons.values()],
                          [tr("Cancel" if label == cancel_for else label) for label in labels])
         return menu
@@ -250,6 +250,83 @@ class DesktopTest(unittest.TestCase):
                     launch.assert_called_once_with(package, cwd=package.parent)
                     self.assertIn("Launch failed", self.ui.status.get())
             self.ui.app_menu.dismiss()
+
+    def test_close_and_install_waits_for_running_portable_app(self):
+        key = self.keys[1]
+        recipe = self.ui.jobs[key]
+        cache = recipe.cache_root(self.dest)
+        cache.mkdir(parents=True)
+        package = cache / "Portable.exe"
+        package.touch()
+        (cache / "current.json").write_text(json.dumps({
+            "version": "1", "release": "a" * 32, "sha256": {}, "published": {"path": str(package)},
+        }))
+        closing, exited = Event(), Event()
+
+        def wait_for_exit(_path):
+            closing.set()
+            return exited.wait(5)
+
+        with (patch("shelf_window.app_is_running", return_value=True) as running,
+              patch("shelf_window.close_running_app", side_effect=wait_for_exit) as close,
+              patch("shelf_window.os.startfile", create=True) as launch):
+            self.right_click_app(key, install_label="Close and Install").buttons["Install"].invoke()
+            try:
+                self.wait_for(closing.is_set)
+                running.assert_called_once_with(package)
+                close.assert_called_once_with(package)
+                launch.assert_not_called()
+            finally:
+                exited.set()
+                self.wait_until_idle()
+            launch.assert_called_once_with(package, cwd=package.parent)
+
+    def test_close_and_install_uses_configured_exe_and_stops_if_it_stays_open(self):
+        path = self.ui.catalog / "local.json"
+        package = self.ui.catalog / "setup.msi"
+        package.touch()
+        path.write_text(json.dumps({"id": "local", "local_path": package.name}))
+        self.ui.reload()
+        self.ui.select_view("local")
+        self.ui.open_editor(path)
+        app = self.ui.catalog / "Installed app.exe"
+        self.ui.editor.fields["running_exe"].set(str(app))
+        self.ui.editor.save_button.invoke()
+        self.assertEqual(self.ui.jobs[str(path)].running_exe, app)
+        with (patch("shelf_window.app_is_running", return_value=True) as running,
+              patch("shelf_window.close_running_app", return_value=False) as close,
+              patch("shelf_window.os.startfile", create=True) as launch):
+            self.click(self.right_click_app(str(path), install_label="Close and Install").buttons["Install"])
+            running.assert_called_once_with(app)
+            close.assert_called_once_with(app)
+            launch.assert_not_called()
+            self.assertIn("is still running", self.ui.status.get())
+            running.return_value = False
+            self.right_click_app(str(path)).buttons["Install"].invoke()
+            launch.assert_called_once_with(package, cwd=package.parent)
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
+    def test_close_and_install_publishes_pending_portable_update_before_launch(self):
+        key = self.keys[0]
+        live = self.dest.parent / "Portable.exe"
+        live.write_bytes(b"old")
+        self.dest.mkdir()
+        self.ui.targets.write_text(json.dumps({"alpha": str(live)}))
+        with live.open("rb") as running_file:
+            with (patch("fetch_sources.read_page", return_value="1"),
+                  patch("fetch_sources.open_url", side_effect=download_fixture)):
+                self.ui.start("fetch", key=key)
+                self.wait_until_idle()
+            self.assertEqual(self.ui.results[key].locked_path, live)
+            with (patch("shelf_window.app_is_running", return_value=True) as running,
+                  patch("shelf_window.close_running_app", side_effect=lambda _: running_file.close() or True),
+                  patch("fetch_sources.read_page") as publisher,
+                  patch("shelf_window.os.startfile", create=True) as launch):
+                launch.side_effect = lambda *args, **kwargs: self.assertEqual(live.read_bytes(), b"fixture")
+                self.click(self.right_click_app(key, install_label="Close and Install").buttons["Install"])
+                running.assert_called_once_with(live)
+                launch.assert_called_once_with(live, cwd=live.parent)
+                publisher.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "win32", "Windows installation")
     def test_local_post_install_restore_and_saved_opt_out(self):
@@ -2850,6 +2927,24 @@ class DesktopTest(unittest.TestCase):
         self.assertIn("2 canceled", self.ui.status.get())
         self.assertTrue(all(self.ui.tree.set(key, "Status") == "Unknown" for key in self.keys))
 
+    def test_github_rate_limit_wait_is_visible_and_cancelable(self):
+        key = self.keys[0]
+        Path(key).write_text(json.dumps({"id": "alpha", "github": "owner/tool", "asset_pattern": "tool.exe"}))
+        self.ui.reload()
+        self.ui.change_language("uk")
+        with (patch("fetch_sources._github_reset", time() + 60),
+              patch("urllib.request.OpenerDirector.open") as request):
+            self.ui.start("fetch", key=key)
+            try:
+                self.wait_for(lambda: self.ui.status.get() == tr(GITHUB_PAUSED))
+                self.assertEqual(self.ui.tree.set(key, "Status"), tr(GITHUB_PAUSED))
+                self.assertEqual(self.ui.view_counts["progress"].get(), "0")
+            finally:
+                self.ui.cancel(key)
+                self.wait_until_idle()
+            request.assert_not_called()
+        self.assertEqual(self.ui.results[key].status, "Unknown")
+
     def test_update_all_counts_only_files_needing_download(self):
         def cached_file(url):
             response = io.BytesIO(b"cached")
@@ -2882,7 +2977,7 @@ class DesktopTest(unittest.TestCase):
                     self.assertEqual(self.ui.tree.set(queued, "Status"), "Pending")
                     self.ui.nav_buttons["progress"].invoke()
                     self.wait_for(lambda: all(responses[name].waiting.is_set() for name in names[:3])
-                                  and all(bar.winfo_ismapped() for bar in self.ui.row_bars))
+                                  and sum(bar.winfo_ismapped() for bar in self.ui.row_bars) == 3)
                     self.assertEqual(download.call_count, 3)
                     self.assertEqual(self.ui.tree.set(queued, "Status"), "Pending")
                     self.assertEqual(self.ui.view_counts["attention"].get(), "0")
@@ -2903,6 +2998,36 @@ class DesktopTest(unittest.TestCase):
             self.assertEqual([self.ui.results[key].status for key in self.keys], ["Latest", "Cached"])
             for summary in ("Updated: 4", "Latest: 1", "Cached: 1"):
                 self.assertIn(summary, self.ui.status.get())
+
+    def test_update_all_shows_progress_for_four_concurrent_downloads(self):
+        names = [f"transfer-{index}" for index in range(4)]
+        recipe = Path(self.keys[0]).read_text()
+        for name in ("early", *names):
+            path = self.ui.catalog / f"{name}.json"
+            path.write_text(recipe.replace("alpha", name))
+        self.ui.reload()
+        responses = {name: GatedDownload() for name in names}
+
+        def download(url):
+            return responses.get(Path(url).stem) or download_fixture(url)
+
+        self.root.geometry("1100x760")
+        self.root.deiconify()
+        self.root.update()
+        with (patch("fetch_sources.read_page", return_value="1"),
+              patch("fetch_sources.open_url", side_effect=download)):
+            self.ui.all_buttons["fetch"].invoke()
+            self.ui.nav_buttons["progress"].invoke()
+            try:
+                self.wait_for(lambda: all(response.waiting.is_set() for response in responses.values())
+                              and self.ui.view_counts["progress"].get() == "4"
+                              and sum(bar.winfo_ismapped() for bar in self.ui.row_bars) == 4)
+                self.assertCountEqual([Path(key).stem for key in self.ui.tree.get_children()], names)
+            finally:
+                for response in responses.values():
+                    response.resume.set()
+                self.wait_until_idle()
+        self.assertEqual(self.ui.view_counts["progress"].get(), "0")
 
     def test_update_all_counts_uncached_windows_iso_as_a_download(self):
         image = GatedDownload()
@@ -3432,6 +3557,42 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(self.ui.tree.get_children(), ())
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
         self.assertEqual(self.ui.empty_title.get(), "No operations in progress")
+
+    @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
+    def test_locked_update_resumes_offline_after_reopening(self):
+        first, second = self.keys
+        live = self.dest.parent / "installed.exe"
+        live.write_bytes(b"old")
+        self.dest.mkdir()
+        self.ui.targets.write_text(json.dumps({"alpha": str(live)}))
+        waiting = "Waiting for the app to close"
+        with live.open("rb"):
+            with (patch("fetch_sources.read_page", return_value="1"),
+                  patch("fetch_sources.open_url", side_effect=download_fixture) as download):
+                self.click(self.ui.bulk_buttons["fetch"])
+            self.assertEqual(download.call_count, 2)
+            self.assertEqual(self.ui.displayed_status(first), waiting)
+            self.assertEqual(self.ui.displayed_status(second), "Updated")
+            self.assertEqual(live.read_bytes(), b"old")
+            for view in ("updates", "attention"):
+                self.ui.select_view(view)
+                self.assertEqual(self.ui.tree.get_children(), (first,))
+            self.root.after_cancel(self.ui.publication_timer)
+            self.ui.publication_timer = None
+
+            window = tk.Toplevel(self.root)
+            self.addCleanup(window.destroy)
+            reopened = ShelfWindow(window, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
+            self.assertEqual(reopened.displayed_status(first), waiting)
+            self.assertEqual(reopened.results[first].available, "1")
+
+        with (patch("fetch_sources.read_page") as publisher,
+              patch("fetch_sources.open_url") as download):
+            self.wait_for(lambda: reopened.displayed_status(first) == "Cached" and not reopened.busy)
+            publisher.assert_not_called()
+            download.assert_not_called()
+        self.assertEqual(live.read_bytes(), b"fixture")
+        self.assertFalse((self.dest / "alpha" / "pending.json").exists())
 
     def test_progress_view_tracks_active_batch_item_and_clears_on_completion(self):
         resume = {name: Event() for name in ("alpha", "beta")}

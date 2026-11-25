@@ -7,10 +7,9 @@ import os
 from pathlib import Path
 import re
 import shutil
-import stat
 
 from fetch_sources import Recipe, filename
-from fetch_store import check_link, fetch_lock, read_state
+from fetch_store import check_link, fetch_lock, read_state, retry_readonly_removal, target_for_version
 from releaseshelf import APP_DIR, load_targets, read_jobs
 from shelf_checklist import LocalItem
 
@@ -79,7 +78,7 @@ def deletion_plan(mode, path, job, dest, targets):
             managed = primary.parent in (root / "current", root / "bin")
             if not managed:
                 mappings = load_targets(targets, dest)
-                if not any(mappings.get(key) == primary for key in job.id_keys()):
+                if not any(target_for_version(mappings.get(key), state["version"]) == primary for key in job.id_keys()):
                     raise ValueError(f"Published path no longer matches the item's target mapping: {primary}")
             app_folders.add(primary.parent)
         if (root / ".previous-app").is_dir():
@@ -101,18 +100,6 @@ def deletion_plan(mode, path, job, dest, targets):
                 or (resolved.parent == path.parent.resolve() and resolved.suffix.lower() == ".json")):
             raise ValueError(f"Cannot delete Relf storage or a protected folder: {target}")
     return Deletion(tuple(sorted(folders)), tuple(manifests), cache)
-
-
-def retry_readonly_removal(remove, path, error):
-    if (getattr(error, "winerror", None) != 5 or remove not in (os.unlink, os.rmdir)
-            or not os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY):
-        raise error
-    os.chmod(path, stat.S_IWRITE, follow_symlinks=False)
-    try:
-        remove(path)
-    except OSError:
-        os.chmod(path, stat.S_IREAD, follow_symlinks=False)
-        raise
 
 
 def delete_item(mode, path, job, original, plan, dest, targets):

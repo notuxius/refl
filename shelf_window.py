@@ -18,9 +18,10 @@ from urllib.parse import urlsplit
 from checklist_window import ChecklistWindow
 from companion_buttons import install_and_restore
 from fetch_sources import Recipe
-from fetch_store import Result, apply_published_settings, read_state
+from fetch_store import (DOWNGRADE_SKIPPED, WAITING_FOR_CLOSE, Result, apply_published_settings,
+                         file_in_use, pending_result, read_state)
 from recipe_editor import ACTIONS, ACTION_ICONS, RecipeEditor, save_recipe
-from releaseshelf import (ERRORS, MAX_PARALLEL_ITEMS, UPDATE_RETRY_DELAYS, ChecklistLoadError,
+from releaseshelf import (ERRORS, GITHUB_PAUSED, MAX_PARALLEL_ITEMS, UPDATE_RETRY_DELAYS, ChecklistLoadError,
                           add_recipes_argument, batch_map, default_destination, destination_preference_path,
                           execute, load_targets, local_result, prepare_fetch, read_jobs, updates_disabled)
 from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, run_icon_loader, store_product_id
@@ -35,6 +36,7 @@ from shelf_message import error_detail, message
 from shelf_options import OptionsWindow, read_language
 from shelf_paint import keep_view_visible, show_window, stage_window
 from shelf_progress import DownloadProgress
+from shelf_running_app import app_is_running, close_running_app
 from shelf_scroll import grid_scrollable
 from shelf_text import CELL_TEXT_INSETS, TK_CELL_INSETS, FittedLabel, FittedTreeview, fit_text
 from shelf_theme import (ARROW_DOWN, ARROW_UP, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
@@ -54,11 +56,14 @@ TRACKED_EXAMPLES = (
     {"id": "autoruns", "name": "Autoruns",
      "direct_download": "https://download.sysinternals.com/files/Autoruns.zip", "extract": ["Autoruns64.exe"]},
 )
-WORKING = {"check": "Checking", "fetch": "Updating", "verify": "Verifying", "apply": "Applying"}
+WORKING = {"check": "Checking", "fetch": "Updating", "resume": "Updating", "verify": "Verifying", "apply": "Applying"}
 RESULT_STATUSES = ("Unknown", "Pending", "Error", "Latest", "Updated", "Cached",
-                   "Repair needed", "Update available", "Source error", "Verified", "Disabled", "Local only")
+                   "Repair needed", "Update available", "Source error", "Verified", "Disabled", "Local only",
+                   WAITING_FOR_CLOSE, DOWNGRADE_SKIPPED)
 SUMMARY_STATUSES = ("Updated", "Cached", "Latest", "Verified", "Applied",
-                    "Partially applied", "Update available", "Pending", "Repair needed", "Error")
+                    "Partially applied", "Update available", "Pending", WAITING_FOR_CLOSE,
+                    DOWNGRADE_SKIPPED, "Repair needed", "Error")
+PUBLICATION_RETRY_MS = 2000
 COLUMN_WIDTHS = {"Name": 126, "Category": 100, "Local version": 94,
                  "Available version": 115, "Status": 108, "Source": 110}
 SORTABLE_COLUMNS = ("Name", "Category", "Status")
@@ -160,13 +165,17 @@ def initial_result(job, dest, checklist_history):
         return Result("Error", detail=error_detail(exc))
     local = current["version"] if current else "-"
     if pending:
-        return Result("Pending", local, detail="Run Get updates to retry publication.")
+        return pending_result(pending, local, "Run Get updates to retry publication.")
     return Result("Unknown", local)
 
 
 def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
     def process(item):
         index, (key, job, cancel_event) = item
+        if cancel_event.is_set():
+            result = Result("Canceled")
+            events.put(("result", key, result))
+            return result
         events.put(("started", key, "check" if action == "fetch" else action, index))
         if action != "fetch":
             result = execute(action, job, dest, targets, cancel_event=cancel_event)
@@ -183,12 +192,22 @@ def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
                 events.put(("prepared", key))
                 result = result.run(on_progress=progress, cancel_event=cancel_event, on_retry=retry)
         events.put(("result", key, result))
+        return result
+
+    def github_paused(item):
+        _, (key, _, _) = item
+        events.put(("github_paused", key))
+
+    def is_canceled(item):
+        _, (_, _, cancel_event) = item
+        return cancel_event.is_set()
 
     try:
         targets = load_targets(targets_path, dest)
         if action == "fetch":
             dest.mkdir(parents=True, exist_ok=True)
-        for _ in batch_map(action, process, enumerate(items, 1)):
+        for _ in batch_map(action, process, enumerate(items, 1), on_github_pause=github_paused,
+                           is_canceled=is_canceled):
             pass
     except Exception as exc:
         events.put(("failed", error_detail(exc)))
@@ -228,11 +247,13 @@ class ShelfWindow:
         self.installing = set()
         self.cancel_events = {}
         self.active_items = {}
+        self.github_paused = set()
         self.retry_counts = {}
         self.transfers = {}
         self.editor = None
         self.options = None
         self.events = Queue()
+        self.publication_timer = None
         root.title("Relf")
         if sys.platform == "win32":
             root.iconbitmap(default=str(ASSETS / "relf.ico"))
@@ -715,8 +736,7 @@ class ShelfWindow:
         self.root.focus_set()
 
     def update_search_hint(self):
-        hint = {"all": "Search tracked items", "checklist": "Search checklist"}.get(self.view.get(), "Search items")
-        self.search_hint.set_text(tr(hint))
+        self.search_hint.set_text(tr("Search"))
         focused = self.root.focus_get() in (self.search_entry, self.search_clear)
         has_query = bool(self.search.get())
         self.search_border.configure(style="Focus.TFrame" if focused else "Line.TFrame")
@@ -883,6 +903,7 @@ class ShelfWindow:
         self.build_column_menu()
         self.app_menu = AppMenu(self.tree)
         self.app_menu_key = None
+        self.app_menu_close_path = None
         for action, label in ACTIONS.items():
             self.app_menu.add_action(label, lambda a=action: self.item_command(a), icon=ACTION_ICONS[action])
         self.app_menu.add_action("Disable updates", self.toggle_updates, icon="pause_circle")
@@ -1126,6 +1147,9 @@ class ShelfWindow:
         if self.icon_timer is not None:
             self.root.after_cancel(self.icon_timer)
             self.icon_timer = None
+        if self.publication_timer is not None:
+            self.root.after_cancel(self.publication_timer)
+            self.publication_timer = None
         if self.icon_thread is not None:
             self.icon_stopped.set()
             self.icon_tasks.put(None)
@@ -1423,12 +1447,12 @@ class ShelfWindow:
             menu = self.category_menu
         else:
             self.app_menu_key = key
-            self.update_app_menu(key)
+            self.update_app_menu(key, check_running=True)
             menu = self.app_menu
         menu.popup(screen_x, screen_y, keyboard=keyboard)
         return "break"
 
-    def update_app_menu(self, key):
+    def update_app_menu(self, key, *, check_running=False):
         token = self.cancel_events.get(key)
         cancel_action = self.requested_action if token is not None and not token.is_set() else None
         job = self.jobs[key]
@@ -1447,8 +1471,15 @@ class ShelfWindow:
         can_open = not self.busy and isinstance(self.jobs[key], (Recipe, LocalItem))
         install = self.app_menu.buttons["Install"]
         cancel_install = cancel_action == "install"
-        install.configure(text=tr("Cancel" if cancel_install else "Install"),
-                          state="normal" if cancel_install or (can_open and key not in self.installing and self.can_install(job)) else "disabled")
+        can_install = can_open and key not in self.installing and self.can_install(job)
+        if check_running:
+            self.app_menu_close_path = self.running_app_path(job) if can_install else None
+        label = "Install"
+        if cancel_install:
+            label = "Cancel"
+        elif can_install and self.app_menu_close_path:
+            label = "Close and Install"
+        install.configure(text=tr(label), state="normal" if cancel_install or can_install else "disabled")
         self.app_menu.set_action_icon(install, "cancel" if cancel_install else "download", self.palette)
         self.app_menu.buttons["Open app folder"].state(["!disabled" if can_open else "disabled"])
         self.app_menu.buttons[MOVE].state(["!disabled" if can_open else "disabled"])
@@ -1557,17 +1588,73 @@ class ShelfWindow:
         except ERRORS:
             return False
 
+    def running_app_path(self, job):
+        try:
+            path = job.running_exe
+            if path is None and isinstance(job, Recipe):
+                targets = load_targets(self.targets, self.dest)
+                mapped = [targets[key] for key in job.id_keys() if key in targets]
+                if len(mapped) > 1:
+                    return None
+                path = mapped[0] if mapped else None
+            if path is None:
+                path = installer_path(job, self.dest)
+            if path and path.suffix.lower() == ".exe" and app_is_running(path):
+                return path
+        except ERRORS:
+            pass  # A process lookup failure leaves the regular Install action available.
+        return None
+
     def install_item(self):
         key = self.app_menu_key
         if self.busy:
             if key == self.install_key:
                 self.cancel(key)
             return
-        self.open_installer(key, fetch_missing=True)
+        if key not in self.jobs or key in self.installing:
+            return
+        path = self.app_menu_close_path
+        if path is None:
+            self.open_installer(key, fetch_missing=True)
+            return
+
+        finished = Queue()
+        name = self.name(key)
+
+        def close_app():
+            try:
+                closed = close_running_app(path)
+            except ERRORS as exc:
+                error = error_detail(exc)
+            else:
+                error = None if closed else message("{name} is still running. Exit it and try Install again.", name=name)
+            finished.put(error)
+
+        def finish_close():
+            try:
+                error = finished.get_nowait()
+            except Empty:
+                self.root.after(100, finish_close)
+                return
+            self.busy = False
+            if error is None:
+                self.open_installer(key, fetch_missing=True)
+            else:
+                self.set_status("{error}", error=error)
+            self.controls()
+
+        self.busy = True
+        self.controls()
+        self.set_status("Closing {name}.", name=name)
+        Thread(target=close_app).start()
+        self.root.after(100, finish_close)
 
     def open_installer(self, key, *, fetch_missing=False):
         job = self.jobs[key]
         try:
+            if fetch_missing and self.results[key].locked_path is not None and not updates_disabled(job):
+                self.start("resume", key=key, install=True)
+                return
             path = installer_path(job, self.dest)
             if path and path.is_file():
                 if key in self.installing:
@@ -1751,6 +1838,41 @@ class ShelfWindow:
             self.view.set("all")
         self.refresh_view(preferred=saved or next(iter(previous), None))
         self.set_status("Ready" if paths else "No items yet")
+        self.schedule_pending_updates()
+
+    def schedule_pending_updates(self):
+        if self.publication_timer is None and any(
+                result.locked_path is not None and not updates_disabled(self.jobs[key])
+                for key, result in self.results.items()):
+            self.publication_timer = self.root.after(PUBLICATION_RETRY_MS, self.check_pending_updates)
+
+    def check_pending_updates(self):
+        self.publication_timer = None
+        if self.busy or self.installing:
+            self.schedule_pending_updates()
+            return
+        waiting = {key: result.locked_path for key, result in self.results.items()
+                   if result.locked_path is not None and not updates_disabled(self.jobs[key])}
+        if not waiting:
+            return
+        ready = Queue()
+
+        def check():
+            ready.put([key for key, path in waiting.items() if not file_in_use(path)])
+
+        def finish():
+            if ready.empty():
+                self.publication_timer = self.root.after(50, finish)
+                return
+            self.publication_timer = None
+            keys = [key for key in ready.get_nowait() if key in self.results
+                    and self.results[key].locked_path == waiting[key]]
+            if keys and not self.installing:
+                self.start("resume", keys=keys)
+            self.schedule_pending_updates()
+
+        Thread(target=check, daemon=True).start()
+        self.publication_timer = self.root.after(50, finish)
 
     def refresh_view(self, *_trace, preferred=None, select_first=True):
         view = self.view.get()
@@ -1853,6 +1975,8 @@ class ShelfWindow:
         return job.category or tr("Checklist" if isinstance(job, Checklist) else "Uncategorized")
 
     def displayed_status(self, key):
+        if key in self.github_paused:
+            return tr("Canceling…" if self.cancel_events[key].is_set() else GITHUB_PAUSED)
         if key in self.active_items:
             if self.cancel_events[key].is_set():
                 return tr("Canceling…")
@@ -1865,10 +1989,11 @@ class ShelfWindow:
             return tr("Disabled")
         if status == "Unknown" and key in self.cancel_events and self.requested_action in ("fetch", "install"):
             return tr("Pending")
-        return tr(status)
+        return tr(self.results[key].display_status)
 
     def shows_error(self, key):
-        return key not in self.active_items and self.results[key].status in ("Error", "Source error")
+        return (key not in self.active_items and key not in self.github_paused
+                and self.results[key].status in ("Error", "Source error"))
 
     def refresh_row_tags(self, key):
         tags = []
@@ -1922,6 +2047,9 @@ class ShelfWindow:
         if isinstance(self.editor, RecipeEditor):
             self.editor.download_progress.update_progress(*self.transfers.get(str(self.editor.path), (None, None)))
         if key is None:
+            if self.github_paused:
+                self.set_status(GITHUB_PAUSED if any(not self.cancel_events[key].is_set() for key in self.github_paused)
+                                else "Canceling…")
             return
         if self.cancel_events[key].is_set():
             self.set_status("Canceling…")
@@ -1993,17 +2121,18 @@ class ShelfWindow:
                 token.set()
         elif key in self.cancel_events:
             self.cancel_events[key].set()
-        for active_key in self.active_items:
+        for active_key in (*self.active_items, *self.github_paused):
             if self.cancel_events[active_key].is_set():
                 self.paint(active_key)
-        if self.active_items:
+        if self.active_items or self.github_paused:
             self.working_status()
         elif key is None:
             self.set_status("Canceling…")
         self.controls()
 
-    def start(self, action, *, key=None, install=False):
-        keys = self.jobs if key is None else (key,)
+    def start(self, action, *, key=None, install=False, keys=None):
+        if keys is None:
+            keys = self.jobs if key is None else (key,)
         if action in APPLY_ACTIONS:
             keys = [k for k in keys if isinstance(self.jobs[k], Checklist)
                     and (action == "apply_all" or k in self.checked_items)]
@@ -2015,7 +2144,7 @@ class ShelfWindow:
         self.cancel_events = {recipe_key: Event() for recipe_key in keys}
         self.install_key = key if install else None
         self.requested_action = "install" if install else action
-        self.bulk_action = action if key is None else None
+        self.bulk_action = action if key is None and action != "resume" else None
         self.total, self.finished, self.canceled, self.failure = len(keys), 0, 0, ""
         self.batch_outcomes = Counter()
         self.unresolved_checks = set(keys) if action == "fetch" else set()
@@ -2035,7 +2164,7 @@ class ShelfWindow:
             delays = UPDATE_RETRY_DELAYS if self.bulk_action == "fetch" else ()
             Thread(target=run_batch, args=(self.events, action, items, self.dest, self.targets),
                    kwargs={"retry_delays": delays}).start()
-        label = ALL_ACTIONS[action] if key is None else ACTIONS[action]
+        label = ACTIONS["fetch"] if action == "resume" else (ALL_ACTIONS if key is None else ACTIONS)[action]
         if install:
             label = "Install"
         self.root.after(50, self.poll, action, label)
@@ -2058,7 +2187,19 @@ class ShelfWindow:
             status_changed = True
             if event == "started":
                 key, phase, index = data
+                self.github_paused.discard(key)
                 self.active_items[key] = (phase, index)
+                self.paint(key)
+                view_changed = True
+            elif event == "github_paused":
+                key, = data
+                self.active_items.pop(key, None)
+                self.retry_counts.pop(key, None)
+                self.transfers.pop(key, None)
+                self.pending_downloads.discard(key)
+                if action == "fetch":
+                    self.unresolved_checks.add(key)
+                self.github_paused.add(key)
                 self.paint(key)
                 view_changed = True
             elif event == "prepared":
@@ -2090,6 +2231,7 @@ class ShelfWindow:
             elif event == "result":
                 key, result = data
                 self.active_items.pop(key, None)
+                self.github_paused.discard(key)
                 self.retry_counts.pop(key, None)
                 self.transfers.pop(key, None)
                 self.pending_downloads.discard(key)
@@ -2104,8 +2246,8 @@ class ShelfWindow:
                 else:
                     self.results[key] = result
                     self.finished += 1
-                    self.batch_outcomes["Error" if result.status == "Source error" else result.status] += 1
-                    if action == "fetch" and result.status in ("Updated", "Cached", "Pending"):
+                    self.batch_outcomes["Error" if result.status == "Source error" else result.display_status] += 1
+                    if action in ("fetch", "resume") and result.status in ("Updated", "Cached", "Pending"):
                         self.invalidate_app_icon(key)
                         if self.show_app_icons.get():
                             self.set_app_icon(key)
@@ -2117,6 +2259,7 @@ class ShelfWindow:
                     self.editor.error.set(tr("Could not finish: {error}", error=tr(self.failure)))
             else:
                 self.active_items.clear()
+                self.github_paused.clear()
                 self.retry_counts.clear()
                 self.transfers.clear()
                 self.working_status()
@@ -2129,6 +2272,7 @@ class ShelfWindow:
                 for key in unprocessed:
                     self.paint(key)
                 self.refresh_view(select_first=False)
+                self.schedule_pending_updates()
                 if self.failure:
                     self.set_status("Could not finish: {error}", error=self.failure)
                 elif not self.canceled and install_key is not None:

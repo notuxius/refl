@@ -5,9 +5,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from queue import Empty, Full, Queue
 from threading import Event, Thread
+from time import sleep
+from urllib.error import HTTPError, URLError
 
 
 _cancel_event = ContextVar("release_cancel_event", default=None)
+publisher_backpressure = ContextVar("publisher_backpressure", default=None)
 
 
 class JobCanceled(Exception):
@@ -17,6 +20,14 @@ class JobCanceled(Exception):
 def check_canceled():
     event = _cancel_event.get()
     if event is not None and event.is_set():
+        raise JobCanceled()
+
+
+def wait_cancellable(seconds):
+    event = _cancel_event.get()
+    if event is None:
+        sleep(seconds)
+    elif event.wait(seconds):
         raise JobCanceled()
 
 
@@ -49,7 +60,27 @@ def file_sha256(stream):
     return checksum.hexdigest()
 
 
+def report_publisher_backpressure(exc):
+    callback = publisher_backpressure.get()
+    event = _cancel_event.get()
+    if callback is None or (event is not None and event.is_set()):
+        return
+    if isinstance(exc, HTTPError):
+        if exc.code in (429, 503):
+            callback()
+    elif isinstance(exc, TimeoutError) or (isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError)):
+        callback()
+
+
 def publisher_items(read):
+    try:
+        yield from _publisher_items(read)
+    except (TimeoutError, URLError) as exc:
+        report_publisher_backpressure(exc)
+        raise
+
+
+def _publisher_items(read):
     """Keep blocked network reads off the job thread. Only the job thread writes the cache."""
     event = _cancel_event.get()
     if event is None:

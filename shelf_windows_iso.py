@@ -11,7 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from shelf_cancel import check_canceled
+from shelf_cancel import check_canceled, report_publisher_backpressure
 from shelf_message import message
 from shelf_version import __version__
 
@@ -120,19 +120,21 @@ def open_windows_iso(version, checksum, mirror=""):
     if mirror:
         try:
             response = open_url(mirror)
-        except HTTPError as exc:
-            exc.close()
-        except URLError:
-            pass
+        except URLError as exc:
+            report_publisher_backpressure(exc)
+            if isinstance(exc, HTTPError):
+                exc.close()
     if response is None:
         request = Request(windows_iso_url(version), headers={"User-Agent": f"Relf/{__version__}"})
         check_canceled()
         try:
             response = build_opener(MicrosoftRedirect()).open(request, timeout=30)
         except HTTPError as exc:
+            report_publisher_backpressure(exc)
             exc.close()
             raise ValueError(message("Microsoft ISO download returned HTTP {status}.", status=exc.code)) from None
-        except URLError:
+        except URLError as exc:
+            report_publisher_backpressure(exc)
             raise ValueError("Could not connect to the Microsoft ISO download server.") from None
     with response:
         check_canceled()

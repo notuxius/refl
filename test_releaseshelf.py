@@ -5,29 +5,114 @@ import io
 import json
 import os
 import runpy
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from email.message import Message
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from queue import Empty, Queue
+import stat
 import subprocess
 import sys
 import tempfile
 from threading import Event, Thread
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.response import addinfourl
 import zipfile
 
-from fetch_sources import Recipe, copy_with_progress, windows_product_version
-from fetch_store import digest, write_state
-from releaseshelf import default_destination, execute
+from fetch_sources import Recipe, copy_with_progress, open_url, windows_product_version
+from fetch_store import DOWNGRADE_SKIPPED, Result, digest, version_is_newer, write_state
+from releaseshelf import batch_map, default_destination, execute
+from shelf_cancel import cancel_scope, publisher_items
 from shelf_theme import preference_path
 
 
 PROJECT = Path(__file__).resolve().parent
+
+
+class AdaptiveBatchTest(unittest.TestCase):
+    def test_batch_grows_slows_and_recovers_with_ordered_results(self):
+        starts = Queue()
+        finish = [Event() for _ in range(27)]
+        errors = {
+            13: HTTPError("https://publisher.example", 429, "Too Many Requests", Message(), None),
+            17: HTTPError("https://publisher.example", 503, "Service Unavailable", Message(), None),
+            21: URLError(TimeoutError("Publisher timed out")),
+        }
+        fail = {index: Event() for index in errors}
+        reported = {index: Event() for index in errors}
+
+        def worker(index):
+            starts.put(index)
+            if index in errors:
+                self.assertTrue(fail[index].wait(10))
+
+                def read():
+                    raise errors[index]
+
+                with cancel_scope(Event()), self.assertRaises(URLError):
+                    list(publisher_items(read))
+                reported[index].set()
+            self.assertTrue(finish[index].wait(10))
+            return Result("Latest", detail=str(index))
+
+        def expect_starts(*indices):
+            self.assertCountEqual([starts.get(timeout=5) for _ in indices], indices)
+
+        def expect_no_start():
+            with self.assertRaises(Empty):
+                starts.get(timeout=0.1)
+
+        def report(index):
+            fail[index].set()
+            self.assertTrue(reported[index].wait(5))
+
+        with ThreadPoolExecutor(max_workers=1) as runner:
+            results = runner.submit(list, batch_map("fetch", worker, range(len(finish))))
+            try:
+                expect_starts(0, 1, 2)
+                expect_no_start()
+                # Keep the first result blocked while the scheduler refills in completion order.
+                next_start = 3
+                for index in range(1, 13):
+                    finish[index].set()
+                    new_slots = 2 if index in (3, 6, 9) else 1
+                    expect_starts(*range(next_start, next_start + new_slots))
+                    next_start += new_slots
+                expect_no_start()
+
+                report(13)
+                for index in (0, 14, 15):
+                    finish[index].set()
+                expect_no_start()
+                finish[16].set()
+                expect_starts(18)
+
+                report(17)
+                finish[13].set()
+                finish[17].set()
+                expect_no_start()
+                finish[18].set()
+                expect_starts(19)
+                for index in (19, 20):
+                    finish[index].set()
+                    expect_starts(index + 1)
+                report(21)
+                for index in (21, 22, 23):
+                    finish[index].set()
+                    expect_starts(index + 1)
+                    expect_no_start()
+                finish[24].set()
+                expect_starts(25, 26)
+            finally:
+                for event in (*fail.values(), *finish):
+                    event.set()
+            self.assertEqual([result.detail for result in results.result(timeout=5)],
+                             [str(index) for index in range(len(finish))])
 
 
 class Publisher(SimpleHTTPRequestHandler):
@@ -188,6 +273,103 @@ class RelfTest(unittest.TestCase):
             with self.subTest(source=source), patch("fetch_sources.open_url", side_effect=reply):
                 self.assertEqual(job.resolve().version, expected)
                 self.assertLess(sum(counts), len(payload))
+
+    @unittest.skipUnless(os.name == "nt", "Uses a real Windows executable")
+    def test_direct_version_uses_one_full_response_when_ranges_are_ignored(self):
+        exe = Path(sys.executable)
+        payload = exe.read_bytes()
+        url = "https://publisher.example/setup.exe"
+        stamp = "Tue, 10 Nov 2026 16:20:57 GMT"
+        job = Recipe.from_data({"id": "setup", "direct_download": url, "direct_version": "file_version"})
+
+        def reply(_url, *, method=None, headers=None):
+            meta = Message()
+            if method == "HEAD":
+                meta["Last-Modified"] = stamp
+                meta["Content-Length"] = str(len(payload))
+                return addinfourl(io.BytesIO(), meta, url, 200)
+            self.assertEqual(headers, {"Range": "bytes=0-63", "If-Unmodified-Since": stamp})
+            meta["Last-Modified"] = transfer_stamp
+            return addinfourl(io.BytesIO(body), meta, url, 200)
+
+        transfer_stamp, body = stamp, payload
+        with patch("fetch_sources.open_url", side_effect=reply) as request:
+            self.assertEqual(job.resolve().version, windows_product_version(exe))
+            self.assertEqual(request.call_count, 2)
+            body = payload[:-1]
+            with self.assertRaisesRegex(ValueError, "Installer size changed"):
+                job.resolve()
+            transfer_stamp, body = "Wed, 11 Nov 2026 16:20:57 GMT", payload
+            with self.assertRaisesRegex(ValueError, "requested installer metadata"):
+                job.resolve()
+
+    def test_github_rate_limit_parks_only_github_jobs_until_reset(self):
+        now = 1000
+        jobs = [Recipe.from_data({"id": f"github-{index}", "github": f"owner/tool-{index}",
+                                  "asset_pattern": "setup.exe"}) for index in range(4)]
+        jobs.append(Recipe.from_data(self.recipe))
+        cancel = {job.id: Event() for job in jobs}
+        paused, finished = Queue(), Queue()
+        requests = []
+
+        def reply(request, timeout):
+            if request.host != "api.github.com":
+                requests.append("publisher")
+                return self.reply(request, timeout)
+            path = urlsplit(request.full_url).path
+            requests.append(path)
+            if now < 1060:
+                meta = Message()
+                meta["X-RateLimit-Remaining"] = "0"
+                meta["X-RateLimit-Reset"] = "1060"
+                raise HTTPError(request.full_url, 403, "rate limit exceeded", meta, None)
+            data = {"tag_name": "v1", "assets": [{"name": "setup.exe",
+                    "browser_download_url": "https://publisher.example/setup.exe"}]}
+            return addinfourl(io.BytesIO(json.dumps(data).encode()), Message(), request.full_url, 200)
+
+        def check(job):
+            result = execute("check", job, self.dest, {}, cancel_event=cancel[job.id])
+            finished.put((job.id, result.status))
+            return result
+
+        with (patch("fetch_sources._github_reset", 0), patch("fetch_sources.time", side_effect=lambda: now),
+              patch("releaseshelf.START_PARALLEL_ITEMS", 1),
+              patch("urllib.request.OpenerDirector.open", side_effect=reply),
+              ThreadPoolExecutor(max_workers=1) as runner):
+            results = runner.submit(list, batch_map("check", check, jobs, on_github_pause=paused.put,
+                                                    is_canceled=lambda job: cancel[job.id].is_set()))
+            try:
+                self.assertEqual([paused.get(timeout=5) for _ in range(4)], jobs[:4])
+                self.assertEqual(finished.get(timeout=5), (jobs[4].id, "Update available"))
+                self.assertEqual(requests, ["/repos/owner/tool-0/releases/latest", "publisher"])
+                cancel[jobs[1].id].set()
+                self.assertEqual(finished.get(timeout=5), (jobs[1].id, "Canceled"))
+            finally:
+                now = 1060
+            self.assertEqual([result.status for result in results.result(timeout=5)],
+                             ["Update available", "Canceled", "Update available", "Update available", "Update available"])
+            self.assertEqual(requests[2:], [f"/repos/owner/tool-{index}/releases/latest" for index in (0, 2, 3)])
+
+    def test_single_github_request_honors_retry_after_and_preserves_plain_403(self):
+        now = 1000
+        url = "https://api.github.com/repos/owner/tool/releases/latest"
+        headers = Message()
+        headers["Retry-After"] = "15"
+        soft_limit = HTTPError(url, 403, "secondary rate limit", headers, None)
+        forbidden = HTTPError(url, 403, "Forbidden", {}, None)
+
+        def wait(seconds):
+            nonlocal now
+            now += seconds
+
+        with (patch("fetch_sources._github_reset", 0), patch("fetch_sources.time", side_effect=lambda: now),
+              patch("fetch_sources.wait_cancellable", side_effect=wait) as sleeper,
+              patch("urllib.request.OpenerDirector.open", side_effect=[soft_limit, forbidden]) as request):
+            with self.assertRaises(HTTPError) as failure:
+                open_url(url)
+            self.assertIs(failure.exception, forbidden)
+            sleeper.assert_called_once_with(15)
+            self.assertEqual(request.call_count, 2)
 
     def test_version_and_build_tokens_come_from_same_page_match(self):
         data = {**self.recipe, "version_pattern": r"v([0-9.]+) build (?P<asset>\d+)",
@@ -366,8 +548,8 @@ class RelfTest(unittest.TestCase):
             self.assertEqual((live / "settings/default.ini").read_bytes(), b"first")
             link.unlink()
             self.assertEqual(run("check").status, "Repair needed")
-            with patch("fetch_store.write_shortcut", side_effect=PermissionError("locked shortcut")):
-                self.assertEqual(run("fetch").status, "Pending")
+            with patch("fetch_store.write_shortcut", side_effect=PermissionError(13, "Access denied", str(link), 5)):
+                self.assertEqual(run("fetch").display_status, "Pending")
             self.assertEqual(run("fetch").status, "Cached")
             self.assertTrue(link.is_file())
             self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
@@ -756,6 +938,9 @@ class RelfTest(unittest.TestCase):
         for folder in (stale, previous, personal):
             folder.mkdir()
             (folder / "file.txt").write_text("fixture")
+        if os.name == "nt":
+            (stale / "file.txt").chmod(stat.S_IREAD)
+            stale.chmod(stat.S_IREAD)
         self.cli("check")
         self.cli("verify")
         self.assertTrue(stale.is_dir())
@@ -818,6 +1003,41 @@ class RelfTest(unittest.TestCase):
         self.page.write_text("version=1.0 sha256=unfinished")
         self.assertIn("Invalid SHA-256", self.cli("fetch", success=False))
         self.assertEqual(self.requests.count("/images/1.0/live-1.0.iso"), 3)
+
+    def test_versioned_iso_target_retires_only_its_unchanged_previous_file(self):
+        self.recipe.pop("extract")
+        self.recipe["download"] = self.recipe["page"].replace("page.html", "live.iso")
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        image = self.publisher / "live.iso"
+        image.write_bytes(b"first image")
+        folder = self.dest.parent / "images"
+        folder.mkdir()
+        self.dest.mkdir()
+        targets = self.dest / "targets.json"
+        template = folder / "Live {version}.iso"
+        previous, current = (folder / f"Live {version}.iso" for version in ("1.27", "1.28"))
+        targets.write_text(json.dumps({self.recipe["id"]: str(template), "other": str(previous)}))
+        self.assertIn("Versioned ISO target overlaps", self.cli("fetch", success=False))
+        targets.write_text(json.dumps({self.recipe["id"]: str(template)}))
+        self.assertIn("Updated: 1.27", self.cli("fetch"))
+        self.assertIn(f"SHA-256 verified: {previous}", self.cli("verify"))
+
+        self.page.write_text("SampleTool v1.28")
+        image.write_bytes(b"second image")
+        current.write_bytes(b"unrelated file")
+        self.assertIn("A different file already exists", self.cli("fetch", expected_code=1))
+        self.assertEqual(current.read_bytes(), b"unrelated file")
+        self.assertTrue(previous.is_file())
+        current.unlink()
+        self.assertIn("Cached: 1.28", self.cli("fetch"))
+        self.assertFalse(previous.exists())
+        self.assertIn(f"SHA-256 verified: {current}", self.cli("verify"))
+
+        current.write_bytes(b"personal changes")
+        self.page.write_text("SampleTool v1.29")
+        self.assertIn("Updated: 1.29", self.cli("fetch"))
+        self.assertEqual(current.read_bytes(), b"personal changes")
+        self.assertEqual((folder / "Live 1.29.iso").read_bytes(), b"second image")
 
     def test_expanded_archive_name_is_validated_before_download(self):
         recipe = Recipe.from_data({
@@ -959,6 +1179,109 @@ class RelfTest(unittest.TestCase):
             publisher.assert_called_once()
             self.assertEqual(execute("verify", recipe, self.dest, {}).status, "Verified")
 
+    def test_version_precedence(self):
+        for newer, older in (("v1.10", "1.9"), ("1.2.3+build", "1.2.3-rc.10"),
+                             ("1.2.3-rc.10", "1.2.3-rc.2"),
+                             ("2026-11-25 12:00:00 UTC", "2026-11-24 12:00:00 UTC")):
+            with self.subTest(newer=newer, older=older):
+                self.assertTrue(version_is_newer(newer, older))
+                self.assertFalse(version_is_newer(older, newer))
+        self.assertFalse(version_is_newer("1.2.0.0", "v1.2+build"))
+        self.assertFalse(version_is_newer("2026-11-25 12:00:00 UTC", "1.2"))
+        self.assertFalse(version_is_newer("2026-11-25", "v1.0"))
+
+    def test_older_publisher_release_cannot_replace_a_managed_version(self):
+        self.page.write_text("SampleTool v1.30")
+        self.cli("fetch")
+        state = self.manifest.read_bytes()
+        target = Path(json.loads(state)["published"]["path"])
+        installed = target.read_bytes()
+        self.page.write_text("SampleTool v1.27")
+        for action in ("check", "fetch"):
+            self.assertIn(DOWNGRADE_SKIPPED, self.cli(action))
+        self.assertEqual(target.read_bytes(), installed)
+        self.assertEqual(self.manifest.read_bytes(), state)
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
+
+    @unittest.skipUnless(os.name == "nt", "Windows version resource")
+    def test_newer_external_executable_survives_cached_repair_and_download(self):
+        recipe = dict(self.recipe, download=self.recipe["download"].replace("sample-tool.zip", "SampleTool.exe"))
+        del recipe["extract"]
+        self.recipe_file.write_text(json.dumps(recipe))
+        package = self.publisher / "SampleTool.exe"
+        executable = Path(sys.executable)
+        installed = executable.read_bytes()
+        version = windows_product_version(executable)
+        older = "1" + version[1:]
+        package.write_bytes(installed.replace(version.encode("utf-16le"), older.encode("utf-16le")))
+        live = self.publisher.parent / "installed" / "SampleTool.exe"
+        self.dest.mkdir()
+        (self.dest / "targets.json").write_text(json.dumps({recipe["id"]: str(live)}))
+        self.cli("fetch")
+        self.assertEqual(windows_product_version(live), older)
+        state = self.manifest.read_bytes()
+        live.write_bytes(installed)
+        for action in ("check", "verify", "fetch"):
+            with self.subTest(action=action):
+                self.assertIn(DOWNGRADE_SKIPPED, self.cli(action, expected_code=1 if action == "verify" else 0))
+                self.assertEqual(live.read_bytes(), installed)
+                self.assertEqual(self.manifest.read_bytes(), state)
+        self.assertEqual(self.requests.count("/SampleTool.exe"), 1)
+
+        self.page.write_text("SampleTool v1.28")
+        self.assertIn(DOWNGRADE_SKIPPED, self.cli("fetch"))
+        self.assertEqual(live.read_bytes(), installed)
+        self.assertEqual(self.manifest.read_bytes(), state)
+        self.assertFalse((self.job / "pending.json").exists())
+        self.assertEqual(self.requests.count("/SampleTool.exe"), 2)
+        self.assertEqual([path.name for path in (self.job / "releases").iterdir()], [json.loads(state)["release"]])
+
+        live.write_bytes(package.read_bytes())
+        package.write_bytes(package.read_bytes() + b"new build of the old version")
+
+        def external_update_during_publication(path, data):
+            write_state(path, data)
+            if path.name == "pending.json":
+                live.write_bytes(installed)
+
+        with patch("fetch_store.write_state", side_effect=external_update_during_publication):
+            self.assertIn(DOWNGRADE_SKIPPED, self.cli("fetch"))
+        self.assertEqual(live.read_bytes(), installed)
+        self.assertEqual(self.manifest.read_bytes(), state)
+        self.assertFalse((self.job / "pending.json").exists())
+
+        updated = installed.replace(version.encode("utf-16le"), ("9" + version[1:]).encode("utf-16le"))
+        package.write_bytes(updated)
+        self.assertIn("Updated", self.cli("fetch"))
+        self.assertEqual(live.read_bytes(), updated)
+
+    @unittest.skipUnless(os.name == "nt", "Windows version resources and sharing semantics")
+    def test_queued_portable_folder_keeps_a_newer_executable_installed_while_waiting(self):
+        executable = Path(sys.executable)
+        installed = executable.read_bytes()
+        version = windows_product_version(executable)
+        candidate = installed.replace(version.encode("utf-16le"), ("1" + version[1:]).encode("utf-16le"))
+        self.cli("fetch")
+        state = self.manifest.read_bytes()
+        target = Path(json.loads(state)["published"]["path"])
+        self.page.write_text("SampleTool v1.28")
+        with zipfile.ZipFile(self.archive, "w") as package:
+            package.writestr(target.name, candidate)
+            package.writestr("help.txt", "older help")
+            package.writestr("notes.txt", "older notes")
+        with target.open("rb"):
+            self.assertIn("Waiting for the app to close", self.cli("fetch", expected_code=2))
+        target.write_bytes(installed)
+        (target.parent / "help.txt").write_text("newer help")
+        recipe = Recipe.read(self.recipe_file)
+        result = execute("resume", recipe, self.dest, {})
+        self.assertEqual((result.status, result.local, result.available), (DOWNGRADE_SKIPPED, version, "1.28"))
+        self.assertEqual(target.read_bytes(), installed)
+        self.assertEqual((target.parent / "help.txt").read_text(), "newer help")
+        self.assertEqual(self.manifest.read_bytes(), state)
+        self.assertFalse((self.job / "pending.json").exists())
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
+
     @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
     def test_locked_custom_target_retries_cached_release(self):
         live = Path(self.temp.name) / "installed" / "my-tool.exe"
@@ -973,16 +1296,41 @@ class RelfTest(unittest.TestCase):
             for name in self.recipe["extract"]:
                 package.writestr(name, "updated")
         with live.open("rb"):
-            self.assertIn("Pending", self.cli("fetch", expected_code=2))
+            self.assertIn("Waiting for the app to close", self.cli("fetch", expected_code=2))
             self.assertEqual(live.read_bytes(), old)
             self.assertEqual(self.manifest.read_bytes(), old_state)
-            self.assertIn("Pending", self.cli("check", expected_code=2))
-            self.assertIn("Pending", self.cli("verify", expected_code=1))
+            self.assertIn("Waiting for the app to close", self.cli("check", expected_code=2))
+            self.assertIn("Waiting for the app to close", self.cli("verify", expected_code=1))
         self.assertIn("Cached: 1.28", self.cli("fetch"))
         self.assertEqual(live.read_bytes(), b"updated")
         self.assertFalse((self.job / "pending.json").exists())
         self.assertEqual([p.name for p in (self.job / "releases").iterdir()],
                          [json.loads(self.manifest.read_text())["release"]])
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
+
+    @unittest.skipUnless(os.name == "nt", "Windows executable sharing semantics")
+    def test_running_portable_app_keeps_its_folder_until_it_exits(self):
+        with zipfile.ZipFile(self.archive, "w") as package:
+            package.write(Path(os.environ["SystemRoot"]) / "System32/ping.exe", "SampleTool.exe")
+            package.writestr("help.txt", "help")
+            package.writestr("notes.txt", "notes")
+        self.cli("fetch")
+        live = self.job / "current" / "SampleTool.exe"
+        with subprocess.Popen([str(live), "127.0.0.1", "-n", "15"], creationflags=subprocess.CREATE_NO_WINDOW,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as app:
+            try:
+                self.assertIsNone(app.poll())
+                self.page.write_text("SampleTool v1.28")
+                with zipfile.ZipFile(self.archive, "w") as package:
+                    for name in self.recipe["extract"]:
+                        package.writestr(name, "updated")
+                self.assertIn("Waiting for the app to close", self.cli("fetch", expected_code=2))
+                self.assertEqual((live.parent / "help.txt").read_text(), "help")
+                self.assertFalse((self.job / ".previous-app").exists())
+            finally:
+                app.terminate()
+        self.assertIn("Cached: 1.28", self.cli("fetch"))
+        self.assertEqual(live.read_bytes(), b"updated")
         self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
 
     @unittest.skipUnless(os.name == "nt", "Windows version resource")

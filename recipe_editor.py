@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from companion_buttons import add_companion_buttons
 from fetch_sources import Recipe, WINDOWS_ISO_PAGE, WINDOWS_ISO_RESOLVER
@@ -28,7 +28,7 @@ SOURCE_FIELDS = {"Publisher page": PAGE_FIELDS, "GitHub release": GITHUB_FIELDS,
                  "Direct download": ("direct_download",), "Local file or folder": ("local_path",)}
 OPTIONAL_FIELDS = ("filename", "sha256", "product_version", "publish_exe", "extract_folder", "shortcut")
 FIELD_LABELS = {
-    "id": "Item ID", "name": "Name", "category": "Category",
+    "id": "Item ID", "name": "Name", "category": "Category", "running_exe": "Running app EXE (optional)",
     "page": "Publisher page URL", "version_pattern": "Version pattern", "download": "Download URL",
     "direct_version": "Version source (optional)", "direct_download": "Download URL", "local_path": "Local path",
     "github": "Repository", "asset_pattern": "Asset pattern", "filename": "Archive filename",
@@ -165,6 +165,9 @@ class RecipeEditor(tk.Toplevel):
             ttk.Label(catalog_tab, text=tr("Leave blank to show the item ID."),
                       style="Muted.TLabel").grid(row=3, column=1, sticky="w", pady=(0, 10))
             self.field(catalog_tab, 4, "category", choices=categories)
+            self.field(catalog_tab, 5, "running_exe")
+            ttk.Button(catalog_tab, text=tr("Browse."), command=self.browse_running_exe).grid(
+                row=5, column=2, sticky="w", padx=(6, 0))
             self.apply_settings = tk.BooleanVar(self, self.data.get("apply_custom_settings", False))
             self.restore_after_install = tk.BooleanVar(self, self.data.get("restore_after_install", True))
             if path is not None:
@@ -173,14 +176,14 @@ class RecipeEditor(tk.Toplevel):
                 if isinstance(item, Recipe) and (item.apply_custom_settings or portable_settings):
                     self.settings_button = ttk.Checkbutton(catalog_tab, text=tr("Apply custom settings"),
                                                            variable=self.apply_settings)
-                    self.settings_button.grid(row=5, column=1, sticky="w", pady=(8, 0))
+                    self.settings_button.grid(row=6, column=1, sticky="w", pady=(8, 0))
                     ttk.Label(catalog_tab, text=tr("Use the saved config on Save and Get updates."),
-                              style="Muted.TLabel").grid(row=6, column=1, sticky="w")
+                              style="Muted.TLabel").grid(row=7, column=1, sticky="w")
                 if item.companions.script or portable_settings:
                     ttk.Checkbutton(catalog_tab, text=tr("Run restore script after installation"),
-                                    variable=self.restore_after_install).grid(row=7, column=1, sticky="w", pady=(6, 0))
+                                    variable=self.restore_after_install).grid(row=8, column=1, sticky="w", pady=(6, 0))
                 add_companion_buttons(catalog_tab, self.data, lambda: path.parent / "companions" / path.stem,
-                                      lambda error: self.error.set(error), 8, open_instructions=False,
+                                      lambda error: self.error.set(error), 9, open_instructions=False,
                                       get_app_folder=get_app_folder)
             source = ttk.Frame(tabs, padding=TAB_PADDING)
             source.columnconfigure(1, weight=1)
@@ -347,6 +350,14 @@ class RecipeEditor(tk.Toplevel):
         entry.grid(row=row, column=1, sticky="ew", pady=5)
         return entry
 
+    def browse_running_exe(self):
+        field = self.fields["running_exe"]
+        path = Path(os.path.expandvars(field.get().strip()))
+        if selected := filedialog.askopenfilename(parent=self, title=tr(FIELD_LABELS["running_exe"]),
+                                                   initialdir=path.parent if path.is_absolute() else None,
+                                                   filetypes=[("EXE", "*.exe")]):
+            field.set(selected)
+
     def show_source(self):
         for name, group in self.source_frames.items():
             if name == self.source.get():
@@ -403,7 +414,7 @@ class RecipeEditor(tk.Toplevel):
             data["restore_after_install"] = self.restore_after_install.get()
         if self.apply_settings.get() or "apply_custom_settings" in data:
             data["apply_custom_settings"] = self.apply_settings.get()
-        for key in ("name", "category"):
+        for key in ("name", "category", "running_exe"):
             value = self.fields[key].get().strip()
             if value:
                 data[key] = value
@@ -441,7 +452,7 @@ class RecipeEditor(tk.Toplevel):
                 raise ValueError(message("Enter a value for {key}.", key=message(FIELD_LABELS[key])))
             data[key] = value
         if source == "Local file or folder":
-            local_fields = ("id", "name", "category", "local_path", "restore_script", "restore_after_install",
+            local_fields = ("id", "name", "category", "local_path", "running_exe", "restore_script", "restore_after_install",
                             "restore_as_admin", "manual_files")
             return {key: data[key] for key in local_fields if key in data}
         for key in OPTIONAL_FIELDS:

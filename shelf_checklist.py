@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 
 from fetch_sources import CompanionActions, Recipe, companion_actions, filename
+from shelf_running_app import running_executable
 from shelf_theme import write_preference
 
 
@@ -68,6 +69,7 @@ class LocalItem:
     category: str
     path: Path
     companions: CompanionActions = CompanionActions()
+    running_exe: Path | None = None
 
     def id_keys(self):
         return (self.id.casefold(),)
@@ -86,7 +88,8 @@ def catalog_item(data, *, path=None):
         location = Path(os.path.expandvars(location))
         if not location.is_absolute():
             location = ((path.parent if path else Path.cwd()) / location).resolve()
-        return LocalItem(item_id, name.strip(), category.strip(), location, companion_actions(data))
+        return LocalItem(item_id, name.strip(), category.strip(), location, companion_actions(data),
+                         running_executable(data))
     if not isinstance(data, dict) or data.get("type") != "checklist":
         return Recipe.from_data(data, path=path)
     companion_actions(data)

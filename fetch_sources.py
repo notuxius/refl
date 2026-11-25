@@ -12,18 +12,21 @@ import tarfile
 import tempfile
 import zipfile
 from contextlib import closing
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from time import monotonic
+from threading import Lock
+from time import monotonic, time
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from shelf_cancel import check_canceled, file_sha256, publisher_items, read_chunks
+from shelf_cancel import check_canceled, file_sha256, publisher_items, read_chunks, wait_cancellable
 from shelf_message import message
 from shelf_pe_version import pe_file_version
+from shelf_running_app import running_executable
 from shelf_version import __version__
 from shelf_windows_iso import open_windows_iso
 
@@ -32,6 +35,32 @@ WINDOWS_ISO_RESOLVER = "windows-11-english-x64"
 WINDOWS_ISO_PAGE = "https://www.microsoft.com/en-us/software-download/windows11"
 CONFIG_SUFFIXES = {".ini", ".cfg", ".conf", ".config", ".toml"}
 NAMED_CONFIG_SUFFIXES = CONFIG_SUFFIXES | {".xml", ".json", ".yaml", ".yml", ".properties", ".prefs"}
+MAX_INSTALLER_VERSION_DOWNLOAD = 32 * 1024 * 1024
+_github_reset = 0
+_github_lock = Lock()
+defer_github_checks = ContextVar("defer_github_checks", default=False)
+
+
+class GitHubRateLimited(Exception):
+    pass
+
+
+def github_wait_seconds():
+    with _github_lock:
+        return max(0, _github_reset - time())
+
+
+def record_github_limit(headers, *, rejected=False):
+    global _github_reset
+    now = time()
+    reset = headers.get("X-RateLimit-Reset", "") if headers.get("X-RateLimit-Remaining") == "0" else ""
+    retry = headers.get("Retry-After", "") if rejected else ""
+    resume = max(int(reset) if reset.isdecimal() else 0, now + int(retry) if retry.isdecimal() else 0)
+    if resume <= now:
+        return False
+    with _github_lock:
+        _github_reset = max(_github_reset, resume)
+    return True
 
 
 def filename(value):
@@ -88,7 +117,25 @@ class CheckedRedirect(HTTPRedirectHandler):
 def open_url(url, *, method=None, data=None, headers=None):
     request = Request(source_url(url), headers={"User-Agent": f"Relf/{__version__}", **(headers or {})},
                       method=method, data=data)
-    return build_opener(CheckedRedirect()).open(request, timeout=30)
+    opener = build_opener(CheckedRedirect())
+    if urlsplit(url).hostname != "api.github.com":
+        return opener.open(request, timeout=30)
+    while True:
+        check_canceled()
+        if delay := github_wait_seconds():
+            if defer_github_checks.get():
+                raise GitHubRateLimited()
+            wait_cancellable(delay)
+            continue
+        try:
+            response = opener.open(request, timeout=30)
+        except HTTPError as exc:
+            if exc.code not in (403, 429) or not record_github_limit(exc.headers or {}, rejected=True):
+                raise
+            exc.close()
+        else:
+            record_github_limit(response.headers)
+            return response
 
 
 def read_page(url):
@@ -207,6 +254,7 @@ class Recipe:
     companions: CompanionActions = CompanionActions()
     direct_version: str = ""
     iso_mirror: tuple[str, str] | None = None
+    running_exe: Path | None = None
 
     @classmethod
     def read(cls, path):
@@ -334,6 +382,7 @@ class Recipe:
                    download_resolver=resolver, extract_folder=extract_folder, shortcut=shortcut,
                    apply_custom_settings=apply_settings, settings_files=settings, updates_disabled=updates_disabled,
                    direct_version=direct_version, companions=companions, iso_mirror=iso_mirror,
+                   running_exe=running_executable(data),
                    companion_dir=path.parent / "companions" / path.stem if path is not None else None, **metadata)
 
     def id_keys(self):
@@ -405,20 +454,36 @@ class Recipe:
                 if not length:
                     raise ValueError("Missing installer size for version lookup")
                 size = int(length)
+                installer = None
 
                 def read(offset, count):
+                    nonlocal installer
                     if count <= 0 or offset < 0 or offset + count > size:
                         raise ValueError("Invalid installer metadata range")
+                    if installer is not None:
+                        return bytes(installer[offset:offset + count])
                     end = offset + count - 1
                     headers = {"Range": f"bytes={offset}-{end}", "If-Unmodified-Since": modified}
                     with open_url(url, headers=headers) as part:
-                        if (part.status != 206 or part.headers.get("Content-Range") != f"bytes {offset}-{end}/{size}"
-                                or part.headers.get("Last-Modified") != modified):
+                        content_range = part.headers.get("Content-Range")
+                        if (part.headers.get("Last-Modified") != modified
+                                or (part.status, content_range) not in ((200, None), (206, f"bytes {offset}-{end}/{size}"))):
                             raise ValueError("The server did not return the requested installer metadata")
-                        block = part.read(count + 1)
-                    if len(block) != count:
-                        raise ValueError("Incomplete installer metadata")
-                    return block
+                        if part.status == 206:
+                            block = part.read(count + 1)
+                            if len(block) != count:
+                                raise ValueError("Incomplete installer metadata")
+                            return block
+                        if size > MAX_INSTALLER_VERSION_DOWNLOAD:
+                            raise ValueError("The server requires downloading too much data to check the installer version")
+                        installer = bytearray()
+                        for chunk in read_chunks(part):
+                            installer.extend(chunk)
+                            if len(installer) > size:
+                                break
+                        if len(installer) != size:
+                            raise ValueError("Installer size changed during the version check")
+                        return bytes(installer[offset:offset + count])
 
                 version = installer_version(self.direct_version, size, read)
             else:
@@ -498,8 +563,8 @@ class Recipe:
         return "files/" + self.extract[0] if self.extract else archive
 
 
-def windows_product_version(path):
-    """Read the translated ProductVersion string from a PE without running it."""
+def windows_product_version(path, *, fixed_fallback=False):
+    """Read the ProductVersion from a PE without running it."""
     if os.name != "nt":
         raise ValueError("ProductVersion validation requires Windows")
     api = ctypes.WinDLL("version", use_last_error=True)
@@ -522,6 +587,10 @@ def windows_product_version(path):
                 value = ctypes.wstring_at(pointer.value, length.value).strip("\x00 ")
                 if value:
                     return value
+    if fixed_fallback and query("\\") and length.value >= 24:
+        signature, _, _, _, high, low = (ctypes.c_uint32 * 6).from_address(pointer.value)
+        if signature == 0xfeef04bd and (high or low):
+            return f"{high >> 16}.{high & 65535}.{low >> 16}.{low & 65535}"
     raise ValueError(message("No ProductVersion string in {file}", file=path.name))
 
 

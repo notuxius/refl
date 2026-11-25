@@ -7,16 +7,19 @@ import re
 import sys
 import zipfile
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from http.client import HTTPException
+from itertools import islice
 from pathlib import Path
+from threading import Lock
 from time import sleep
 
-from fetch_sources import Recipe, Release, filename
-from fetch_store import Result, fetch_lock, matches, read_state, run_release, verify
-from shelf_cancel import JobCanceled, cancel_scope, check_canceled, publisher_items
+from fetch_sources import GitHubRateLimited, Recipe, Release, defer_github_checks, filename, github_wait_seconds
+from fetch_store import (DOWNGRADE_SKIPPED, ISO_VERSION, Result, fetch_lock, is_versioned_iso_target, matches, read_state,
+                         resume_publication, run_release, verify)
+from shelf_cancel import JobCanceled, cancel_scope, check_canceled, publisher_backpressure, publisher_items
 from shelf_checklist import Checklist, LocalItem, catalog_item
 from shelf_message import error_detail, message
 
@@ -25,16 +28,88 @@ ERRORS = (OSError, ValueError, LookupError, TypeError, AttributeError, re.error,
           zipfile.BadZipFile, HTTPException, RuntimeError)
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 DEFAULT_CATALOG = APP_DIR / "recipes"
-MAX_PARALLEL_ITEMS = 3
+START_PARALLEL_ITEMS = 3
+MAX_PARALLEL_ITEMS = 6
 UPDATE_RETRY_DELAYS = (1, 2, 4)
+GITHUB_PAUSED = "Waiting for GitHub rate limit reset…"
 
 
-def batch_map(action, worker, items):
+def batch_map(action, worker, items, *, on_github_pause=None, is_canceled=None):
     if action == "verify":
         yield from map(worker, items)
-    else:
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ITEMS) as pool:
+        return
+    if action == "resume":
+        with ThreadPoolExecutor(max_workers=START_PARALLEL_ITEMS) as pool:
             yield from pool.map(worker, items)
+        return
+
+    limit, clean, backoffs = START_PARALLEL_ITEMS, 0, 0
+    lock = Lock()
+
+    def back_off():
+        nonlocal limit, clean, backoffs
+        with lock:
+            limit = max(1, limit // 2)
+            clean = 0
+            backoffs += 1
+
+    def run(item, previous_backoffs):
+        nonlocal limit, clean
+        token = publisher_backpressure.set(back_off)
+        github_token = defer_github_checks.set(True)
+        try:
+            result = worker(item)
+        finally:
+            defer_github_checks.reset(github_token)
+            publisher_backpressure.reset(token)
+        if result.status in {"Latest", "Update available", "Repair needed", "Updated", "Cached", "Pending",
+                             DOWNGRADE_SKIPPED}:
+            with lock:
+                # Measure recovery with jobs admitted after the last slowdown.
+                if previous_backoffs == backoffs:
+                    clean += 1
+                    if clean == 3:
+                        limit = min(MAX_PARALLEL_ITEMS, limit + 1)
+                        clean = 0
+        return result
+
+    remaining = enumerate(items)
+    active, ready, github_paused = {}, {}, {}
+    next_result = 0
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_ITEMS) as pool:
+        while True:
+            delay = github_wait_seconds() if github_paused else 0
+            with lock:
+                for index, item in tuple(github_paused.items()):
+                    if len(active) >= limit:
+                        break
+                    if not delay or (is_canceled is not None and is_canceled(item)):
+                        del github_paused[index]
+                        active[pool.submit(run, item, backoffs)] = index, item
+                for index, item in islice(remaining, max(0, limit - len(active))):
+                    active[pool.submit(run, item, backoffs)] = index, item
+            while next_result in ready:
+                yield ready.pop(next_result).result()
+                next_result += 1
+            if not active and not github_paused:
+                return
+            wake_after = None
+            if github_paused and len(active) < limit:
+                wake_after = github_wait_seconds()
+                if is_canceled is not None:
+                    wake_after = min(wake_after, 0.1)
+            if not active:
+                sleep(wake_after)
+                continue
+            done, _ = wait(active, timeout=wake_after, return_when=FIRST_COMPLETED)
+            for future in done:
+                index, item = active.pop(future)
+                if isinstance(future.exception(), GitHubRateLimited):
+                    if on_github_pause is not None:
+                        on_github_pause(item)
+                    github_paused[index] = item
+                else:
+                    ready[index] = future
 
 
 def updates_disabled(job):
@@ -78,14 +153,15 @@ def load_targets(path, dest):
         raise ValueError("Targets must be an object mapping recipe IDs to absolute file paths")
     targets = {}
     owners = {}
+    settings = path.resolve()
     for job, value in data.items():
         key = filename(job).casefold()
         target = Path(value)
         if not target.is_absolute() or not target.name:
             raise ValueError(message("Use an absolute target filename for {job}", job=job))
         filename(target.name)
-        target = target.resolve()
-        if target.is_relative_to(dest) or target == path.resolve():
+        target = target.parent.resolve() / target.name if is_versioned_iso_target(target) else target.resolve()
+        if target.is_relative_to(dest) or target == settings:
             raise ValueError(message("Custom targets must be outside the managed download folder and settings file: "
                                      "{target}", target=target))
         if key in targets or target in owners:
@@ -93,6 +169,12 @@ def load_targets(path, dest):
                                      path=path, job=job, target=target))
         targets[key] = target
         owners[target] = job
+    for target in (*owners, settings):
+        if target.suffix.lower() != ".iso" or is_versioned_iso_target(target):
+            continue
+        prefix, _, version = target.stem.rpartition(" ")
+        if prefix and ISO_VERSION.fullmatch(version) and target.with_name(f"{prefix} {{version}}{target.suffix}") in owners:
+            raise ValueError(f"Versioned ISO target overlaps a fixed path: {target}")
     return targets
 
 
@@ -100,6 +182,8 @@ def run_job(action, recipe, dest, target, on_progress=None, *, prepared=None, de
     root = recipe.cache_root(dest)
     if action == "verify":
         return verify(root, recipe, target)
+    if action == "resume":
+        return resume_publication(root, recipe, target)
     with fetch_lock(root) if action == "fetch" else nullcontext():
         state = read_state(root, "current.json")
         local = state["version"] if state else "-"
@@ -158,19 +242,27 @@ def main(argv=None):
                 and (args.action == "verify" or not updates_disabled(job))]
 
     def process(item):
-        path, job = item
+        _, job = item
         delays = UPDATE_RETRY_DELAYS if args.all and args.action == "fetch" else ()
-        return path, job, execute(args.action, job, dest, targets, retry_delays=delays)
+        return execute(args.action, job, dest, targets, retry_delays=delays)
 
-    results = batch_map(args.action, process, jobs) if args.all else map(process, jobs)
-    for path, job, result in results:
+    github_pause_announced = False
+
+    def show_github_pause(_item):
+        nonlocal github_pause_announced
+        if not github_pause_announced:
+            print(GITHUB_PAUSED, file=sys.stderr, flush=True)
+            github_pause_announced = True
+
+    results = batch_map(args.action, process, jobs, on_github_pause=show_github_pause)
+    for (path, job), result in zip(jobs, results, strict=True):
         name = path.name if isinstance(job, Result) else job.id
         if args.all:
             detail = " | ".join(result.detail.splitlines())
             print(f"{name}\t{result.local}\t{result.available}\t{result.status}\t{detail}")
         else:
             version = result.available if result.available != "-" else result.local
-            label = "Source Error" if result.status == "Source error" else result.status
+            label = "Source Error" if result.status == "Source error" else result.display_status
             print(f"{label}: {version}\n{result.detail}")
         codes.append(exit_code(args.action, result, args.all))
     return 1 if 1 in codes else max(codes, default=0)
@@ -271,7 +363,7 @@ def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *,
                 return Result("Error", detail="Open the setup checklist in Relf to choose adjustments.")
             if isinstance(job, LocalItem):
                 return local_result(job)
-            if action in ("check", "fetch") and job.updates_disabled:
+            if action in ("check", "fetch", "resume") and job.updates_disabled:
                 return Result("Disabled")
             keys = [key for key in job.id_keys() if key in targets]
             if len(keys) > 1:
