@@ -28,6 +28,7 @@ from shelf_window import ShelfWindow, deletion_dialog
 from shelf_i18n import LANGUAGES, catalog, tr
 from shelf_options import read_language
 from shelf_theme import DARK, LIGHT, PALETTES, category_picker, read_appearance
+from shelf_update import RelfUpdate
 
 
 def descendants(widget):
@@ -1225,7 +1226,7 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         self.assertTrue(menu.winfo_viewable())
         self.assert_dropdown_join(trigger, menu, below=True)
-        self.assertEqual(tuple(menu.buttons), ("Reload", "Verify all items"))
+        self.assertEqual(tuple(menu.buttons), ("Reload", "Verify all items", "Check for Relf updates"))
         row_style = self.ui.app_menu.buttons["Edit item"].cget("style")
         for button in menu.buttons.values():
             self.assertEqual(button.cget("style"), row_style)
@@ -3281,6 +3282,50 @@ class DesktopTest(unittest.TestCase):
                             if b.winfo_ismapped()))
         self.assertIn("0 of 2 processed, 2 canceled", self.ui.status.get())
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
+
+    def test_relf_update_notice_and_confirmed_restart(self):
+        release = RelfUpdate("1.0.0", "- A new release", 123, "a" * 64)
+        executable = self.dest.parent / "Relf.exe"
+        menu_action = self.ui.more_menu.buttons["Check for Relf updates"]
+        notice = self.ui.relf_update_button
+        helper = object()
+        with (patch("shelf_window.relf_executable", return_value=executable),
+              patch("shelf_window.check_for_update", return_value=release) as check,
+              patch("shelf_window.prepare_update", return_value=helper) as update,
+              patch.object(self.ui, "close") as close):
+            self.assertFalse(notice.winfo_manager())
+            self.ui.check_relf_updates(manual=False)
+            self.wait_for(lambda: notice.winfo_manager() == "grid")
+            self.assertIn("Relf update available", notice.cget("text"))
+            self.assertEqual(set(self.ui.jobs), set(self.keys))
+            check.assert_called_once_with()
+            update.assert_not_called()
+
+            displayed_notes = []
+
+            def dialog_button(label):
+                dialog = next((w for w in self.root.winfo_children()
+                               if isinstance(w, tk.Toplevel) and w.title() == "Relf update available"), None)
+                if dialog is None or not dialog.winfo_viewable():
+                    self.root.after(50, dialog_button, label)
+                    return
+                notes = next(w for w in descendants(dialog) if isinstance(w, tk.Text))
+                displayed_notes.append(notes.get("1.0", "end-1c"))
+                next(w for w in descendants(dialog) if isinstance(w, ttk.Button)
+                     and w.cget("text") == label).invoke()
+
+            self.root.deiconify()
+            self.root.after(100, dialog_button, "Cancel")
+            notice.invoke()
+            update.assert_not_called()
+
+            self.root.after(100, dialog_button, "Update and restart")
+            menu_action.invoke()
+            self.wait_for(lambda: close.called)
+            self.assertEqual(displayed_notes, [release.notes, release.notes])
+            self.assertEqual(check.call_count, 2)
+            update.assert_called_once_with(executable, release)
+            self.assertIs(self.ui.relf_update_helper, helper)
 
     def test_more_menu_cancels_bulk_verification_and_keeps_its_size(self):
         from shelf_cancel import check_canceled
