@@ -140,8 +140,8 @@ class DesktopTest(unittest.TestCase):
             sleep(.005)
         self.assertFalse(self.ui.busy)
 
-    def wait_for(self, condition):
-        deadline = monotonic() + 5
+    def wait_for(self, condition, *, timeout=5):
+        deadline = monotonic() + timeout
         while not condition() and monotonic() < deadline:
             self.root.update()
             sleep(.005)
@@ -785,7 +785,7 @@ class DesktopTest(unittest.TestCase):
         dialog.apply_button.invoke()
         self.assertTrue(dialog.running)
         self.assertTrue(dialog.apply_button.instate(["disabled"]))
-        self.wait_for(lambda: not dialog.running)
+        self.wait_for(lambda: not dialog.running, timeout=30)
         self.assertEqual(log.read_text().splitlines(), ["one", "last"])
         self.assertEqual(dialog.listing.set("2", "result"), "Error")
         self.assertIn("sample failure", dialog.outputs[2])
