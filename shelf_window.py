@@ -51,12 +51,10 @@ ALL_ACTIONS = {"fetch": "Update all items", "verify": "Verify all items", **APPL
 BULK_ICONS = {**ACTION_ICONS, "apply_selected": "list_checks", "apply_all": "list_checks"}
 VIEWS = {"checklist": "Checklist", "all": "Tracked", "local": "Local only", "updates": "Available updates",
          "progress": "In progress", "attention": "Needs attention", "disabled": "Disabled"}
-TRACKED_EXAMPLES = (
-    {"id": "process-explorer", "name": "Process Explorer",
-     "direct_download": "https://download.sysinternals.com/files/ProcessExplorer.zip", "extract": ["procexp64.exe"]},
-    {"id": "autoruns", "name": "Autoruns",
-     "direct_download": "https://download.sysinternals.com/files/Autoruns.zip", "extract": ["Autoruns64.exe"]},
-)
+TRACKED_EXAMPLE = {
+    "id": "example-app", "name": "Example app",
+    "direct_download": "https://example.com/downloads/example-app.zip", "extract": ["example-app.exe"],
+}
 WORKING = {"check": "Checking", "fetch": "Updating", "resume": "Updating", "verify": "Verifying", "apply": "Applying"}
 RESULT_STATUSES = ("Unknown", "Pending", "Error", "Latest", "Updated", "Cached",
                    "Repair needed", "Update available", "Source error", "Verified", "Disabled", "Local only",
@@ -381,7 +379,7 @@ class ShelfWindow:
         self.tree.bind("<Configure>", self.fit_table_rows, add="+")
         self.build_footer()
         self.captions = {widget: str(widget.cget("text")) for widget in (
-            self.search_clear, self.reset_search_button,
+            self.search_clear, self.reset_search_button, self.example_button,
             self.add_button, self.edit_button, self.more_button)}
         self.search.trace_add("write", self.search_changed)
         self.view.trace_add("write", self.view_changed)
@@ -977,10 +975,8 @@ class ShelfWindow:
                   wraplength=300, justify="center").pack(pady=(4, 0))
         self.reset_search_button = ttk.Button(self.empty_panel, text="Reset search", command=self.clear_search)
 
-        self.example_choices = ttk.Frame(self.empty_panel, style="Surface.TFrame")
-        for example in TRACKED_EXAMPLES:
-            ttk.Button(self.example_choices, text=example["name"],
-                       command=lambda item=example: self.open_editor(example=item)).pack(side="left", padx=3)
+        self.example_button = ttk.Button(self.empty_panel, text="Open example",
+                                         command=lambda: self.open_editor(example=TRACKED_EXAMPLE))
 
     def fit_table_rows(self, _event=None):
         tree = self.tree
@@ -2084,9 +2080,9 @@ class ShelfWindow:
             else:
                 title, detail = "No issues reported", "Items with source, file, or publication problems appear here."
             if view == "all" and not members and not query:
-                self.example_choices.pack(pady=(10, 0))
+                self.example_button.pack(pady=(10, 0))
             else:
-                self.example_choices.pack_forget()
+                self.example_button.pack_forget()
             self.empty_title.set(tr(title))
             self.empty_detail.set(tr(detail))
             if query and (members or view == "all"):
@@ -2244,8 +2240,7 @@ class ShelfWindow:
         self.more_button.configure(state="normal" if self.bulk_action == "verify" else idle_state)
         self.more_menu.sync_arrow()
         self.add_button.configure(state=idle_state)
-        for button in self.example_choices.winfo_children():
-            button.configure(state=idle_state)
+        self.example_button.configure(state=idle_state)
         self.edit_button.configure(state=selected_state)
         if self.app_menu_key in self.jobs:
             self.update_app_menu(self.app_menu_key)

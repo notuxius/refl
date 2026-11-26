@@ -448,7 +448,7 @@ class DesktopTest(unittest.TestCase):
         self.assertFalse(nav["local"].winfo_manager())
         self.assertEqual(self.ui.view.get(), "all")
 
-    def test_tracked_examples_open_and_save_in_a_local_only_catalog(self):
+    def test_tracked_example_opens_and_saves_in_a_local_only_catalog(self):
         for key in self.keys:
             Path(key).unlink()
         local = self.ui.catalog / "local.json"
@@ -456,18 +456,24 @@ class DesktopTest(unittest.TestCase):
         self.ui.reload()
         self.root.deiconify()
         self.root.update()
-        self.assertTrue(self.ui.example_choices.winfo_viewable())
-        buttons = self.ui.example_choices.winfo_children()
-        self.assertEqual([b.cget("text") for b in buttons], ["Process Explorer", "Autoruns"])
-        buttons[0].invoke()
-        self.assertEqual(self.ui.editor.fields["id"].get(), "process-explorer")
+        button = self.ui.example_button
+        self.assertTrue(button.winfo_viewable())
+        self.assertEqual(button.cget("text"), "Open example")
+        button.invoke()
+        self.assertEqual(self.ui.editor.fields["id"].get(), "example-app")
+        self.assertEqual(self.ui.editor.source.get(), "Direct download")
+        self.assertEqual(self.ui.editor.fields["direct_download"].get(), "https://example.com/downloads/example-app.zip")
+        self.assertEqual(self.ui.editor.text_area.get("1.0", "end-1c"), "example-app.exe")
         self.ui.editor.cancel_button.invoke()
         self.assertEqual(list(self.ui.catalog.glob("*.json")), [local])
-        buttons[1].invoke()
+        button.invoke()
+        download = "https://publisher.example/my-app.zip"
+        self.ui.editor.fields["direct_download"].set(download)
         self.ui.editor.save_button.invoke()
         key, = self.ui.tree.get_children()
-        self.assertEqual(self.ui.tree.set(key, "Name"), "Autoruns")
-        self.assertEqual(self.ui.jobs[key].download, "https://download.sysinternals.com/files/Autoruns.zip")
+        self.assertEqual(self.ui.tree.set(key, "Name"), "Example app")
+        self.assertEqual(self.ui.jobs[key].download, download)
+        self.assertFalse(button.winfo_viewable())
         self.assertEqual(self.ui.view_counts["local"].get(), "1")
 
     def test_local_item_opens_folder_and_edits_without_enabling_updates(self):
