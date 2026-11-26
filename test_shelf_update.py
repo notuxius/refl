@@ -25,7 +25,7 @@ class UpdateTest(unittest.TestCase):
         with (patch("shelf_update.__version__", "0.9.0"),
               patch("shelf_update.read_page", return_value=json.dumps(release)) as page):
             self.assertEqual(check_for_update(), RelfUpdate("0.10.0", "- Release notes", 123, checksum))
-            page.assert_called_once_with(LATEST_RELEASE)
+            page.assert_called_once_with(LATEST_RELEASE, headers={"Cache-Control": "no-cache"})
             for fields in ({"tag_name": "v0.8.0"}, {"tag_name": "v0.9.0"}, {"prerelease": True}, {"draft": True}):
                 page.return_value = json.dumps(release | fields)
                 self.assertIsNone(check_for_update())

@@ -211,6 +211,8 @@
   "Unknown": "Tidak diketahui",
   "Pending": "Menunggu",
   "Waiting for the app to close": "Menunggu aplikasi ditutup",
+  "Downgrade skipped": "Penurunan versi dilewati",
+  "Kept version {installed} because {offered} is older.": "Versi {installed} dipertahankan karena {offered} adalah versi yang lebih lama.",
   "Error": "Kesalahan",
   "Latest": "Sudah terbaru",
   "Updated": "Diperbarui",

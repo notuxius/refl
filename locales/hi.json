@@ -211,6 +211,8 @@
   "Unknown": "अज्ञात",
   "Pending": "लंबित",
   "Waiting for the app to close": "ऐप बंद होने का इंतज़ार",
+  "Downgrade skipped": "पुराने वर्शन पर लौटना छोड़ दिया गया",
+  "Kept version {installed} because {offered} is older.": "वर्शन {installed} रखा गया क्योंकि {offered} उससे पुराना है।",
   "Error": "त्रुटि",
   "Latest": "नवीनतम",
   "Updated": "अपडेट किया गया",

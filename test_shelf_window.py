@@ -19,12 +19,12 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from fetch_store import Result
+from fetch_store import Result, downgrade_result
 from releaseshelf import GITHUB_PAUSED, default_destination, destination_preference_path
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_delete import DELETE, FOLDER, delete_item, deletion_plan
 from shelf_checkboxes import header_image
-from shelf_window import ShelfWindow, deletion_dialog
+from shelf_window import RESULT_STATUSES, SUMMARY_STATUSES, WORKING, ShelfWindow, deletion_dialog
 from shelf_i18n import LANGUAGES, catalog, tr
 from shelf_options import read_language
 from shelf_theme import DARK, LIGHT, PALETTES, category_picker, read_appearance
@@ -997,6 +997,12 @@ class DesktopTest(unittest.TestCase):
                           if name is not None)
 
         reference = catalog("uk")
+        expected_statuses = {
+            *RESULT_STATUSES, *SUMMARY_STATUSES, *WORKING.values(), GITHUB_PAUSED,
+            "In progress", "Downloading", "Canceling…", "Retry {attempt}/{total}", "{action}…",
+            "Not applied", "Running", downgrade_result("2", "1", "1").detail.template,
+        }
+        self.assertFalse(expected_statuses - reference.keys(), expected_statuses - reference.keys())
         for code in LANGUAGES.keys() - {"en"}:
             translations = catalog(code)
             self.assertEqual(translations.keys(), reference.keys(), code)
@@ -2513,14 +2519,27 @@ class DesktopTest(unittest.TestCase):
         nav["attention"].invoke()
         self.assertEqual(self.ui.view.get(), "attention")
 
+        badge_positions = []
+
+        def record_badge_position(event):
+            badge = event.widget
+            button = badge.master
+            icon_right = 1 + int(button["padding"][0]) + self.ui.images[button][0].width()
+            badge_positions.append((badge.winfo_x(), icon_right))
+
+        for badge in (*placements, self.ui.categories_arrow):
+            badge.bind("<Map>", record_badge_position, add="+")
         self.ui.sidebar_toggle.invoke()
         self.root.update()
+        self.assertTrue(badge_positions)
+        for x, icon_right in badge_positions:
+            self.assertGreaterEqual(x, icon_right)
         self.assertEqual(sidebar.winfo_width(), sidebar_width)
         self.assertEqual(tree.winfo_width(), tree_width)
         for button in buttons:
             self.assertEqual(str(button.cget("compound")), "left")
         for view, badge in self.ui.nav_counts.items():
-            self.assertEqual(bool(badge.winfo_viewable()), view not in ("progress", "disabled", "local"))
+            self.assertEqual(bool(badge.winfo_viewable()), view not in ("disabled", "local"))
             self.assertEqual(badge.place_info(), placements[badge])
         self.assertEqual(self.ui.search.get(), "alpha")
         self.assertTrue(nav["attention"].instate(["selected"]))
@@ -2964,6 +2983,16 @@ class DesktopTest(unittest.TestCase):
         self.assertIn("2 canceled", self.ui.status.get())
         self.assertTrue(all(self.ui.tree.set(key, "Status") == "Unknown" for key in self.keys))
 
+    def test_downgrade_status_translates_in_the_app_list_and_summary(self):
+        self.ui.change_language("uk")
+        with patch("shelf_window.prepare_fetch", return_value=downgrade_result("2", "1", "1")):
+            self.click(self.ui.all_buttons["fetch"])
+        for key in self.keys:
+            self.assertEqual(self.ui.tree.set(key, "Status"), "Зниження версії пропущено")
+        self.assertIn("Зниження версії пропущено: 2", self.ui.status.get())
+        self.assertIn("Версію 2 залишено, оскільки версія 1 старіша.",
+                      self.edit_selected().detail.get("1.0", "end"))
+
     def test_github_rate_limit_wait_is_visible_and_cancelable(self):
         key = self.keys[0]
         Path(key).write_text(json.dumps({"id": "alpha", "github": "owner/tool", "asset_pattern": "tool.exe"}))
@@ -2973,14 +3002,17 @@ class DesktopTest(unittest.TestCase):
               patch("urllib.request.OpenerDirector.open") as request):
             self.ui.start("fetch", key=key)
             try:
-                self.wait_for(lambda: self.ui.status.get() == tr(GITHUB_PAUSED))
-                self.assertEqual(self.ui.tree.set(key, "Status"), tr(GITHUB_PAUSED))
-                self.assertEqual(self.ui.view_counts["progress"].get(), "0")
+                self.wait_for(lambda: self.ui.status.get() == "Очікування")
+                self.assertEqual(self.ui.tree.set(key, "Status"), "Очікування")
+                self.assertEqual(self.ui.view_counts["progress"].get(), "1")
+                self.ui.nav_buttons["progress"].invoke()
+                self.assertEqual(self.ui.tree.get_children(), (key,))
             finally:
                 self.ui.cancel(key)
                 self.wait_until_idle()
             request.assert_not_called()
         self.assertEqual(self.ui.results[key].status, "Unknown")
+        self.assertEqual(self.ui.view_counts["progress"].get(), "0")
 
     def test_update_all_counts_only_files_needing_download(self):
         def cached_file(url):
@@ -3018,7 +3050,7 @@ class DesktopTest(unittest.TestCase):
                     self.assertEqual(download.call_count, 3)
                     self.assertEqual(self.ui.tree.set(queued, "Status"), "Pending")
                     self.assertEqual(self.ui.view_counts["attention"].get(), "0")
-                    self.assertEqual({Path(key).stem for key in self.ui.tree.get_children()}, set(names[:3]))
+                    self.assertEqual({Path(key).stem for key in self.ui.tree.get_children()}, set(names))
                     self.assertIn("·  #1", self.ui.status.get())
                     responses["delta"].resume.set()
                     self.wait_for(lambda: responses["gamma"].waiting.is_set() and
@@ -3320,14 +3352,25 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
 
     def test_relf_update_notice_and_confirmed_restart(self):
-        release = RelfUpdate("1.0.0", "- A new release", 123, "a" * 64)
+        earlier_release = RelfUpdate("0.44.1", "- An earlier release", 120, "b" * 64)
+        release = RelfUpdate("1.0.0", "- A new release", 8, hashlib.sha256(b"download").hexdigest())
         executable = self.dest.parent / "Relf.exe"
         menu_action = self.ui.more_menu.buttons["Check for Relf updates"]
         notice = self.ui.relf_update_button
+        progress = self.ui.download_progress
+        response = GatedDownload()
+        verification = GatedPage()
         helper = object()
+
+        def verify_version(_):
+            verification()
+            return release.version
+
         with (patch("shelf_window.relf_executable", return_value=executable),
-              patch("shelf_window.check_for_update", return_value=release) as check,
-              patch("shelf_window.prepare_update", return_value=helper) as update,
+              patch("shelf_window.check_for_update", side_effect=[earlier_release, release, release]) as check,
+              patch("shelf_update.open_url", return_value=response) as download,
+              patch("shelf_update.windows_product_version", side_effect=verify_version),
+              patch("shelf_update.start_update_helper", return_value=helper) as restart,
               patch.object(self.ui, "close") as close):
             self.assertFalse(notice.winfo_manager())
             self.ui.check_relf_updates(manual=False)
@@ -3335,7 +3378,7 @@ class DesktopTest(unittest.TestCase):
             self.assertIn("Relf update available", notice.cget("text"))
             self.assertEqual(set(self.ui.jobs), set(self.keys))
             check.assert_called_once_with()
-            update.assert_not_called()
+            download.assert_not_called()
 
             displayed_notes = []
 
@@ -3360,15 +3403,46 @@ class DesktopTest(unittest.TestCase):
                     self.assertEqual(label.winfo_y() + label.winfo_height() // 2, notice_center)
             self.root.after(100, dialog_button, "Cancel")
             notice.invoke()
-            update.assert_not_called()
+            self.wait_for(lambda: displayed_notes)
+            self.assertEqual(displayed_notes, [release.notes])
+            download.assert_not_called()
 
             self.root.after(100, dialog_button, "Update and restart")
             menu_action.invoke()
+            try:
+                self.wait_for(lambda: response.waiting.is_set() and progress.percent["text"] == "50%")
+                self.assertTrue(progress.winfo_ismapped())
+                self.assertEqual(self.ui.status.get(), "Downloading Relf v1.0.0…")
+                self.assertFalse(notice.winfo_ismapped())
+                response.resume.set()
+                self.wait_for(lambda: verification.entered.is_set() and self.ui.status.get() == "Verifying…")
+                self.assertEqual(progress.percent["text"], "100%")
+                self.assertTrue(progress.winfo_ismapped())
+                restart.assert_not_called()
+            finally:
+                response.resume.set()
+                verification.resume.set()
+
             self.wait_for(lambda: close.called)
             self.assertEqual(displayed_notes, [release.notes, release.notes])
-            self.assertEqual(check.call_count, 2)
-            update.assert_called_once_with(executable, release)
+            self.assertEqual(check.call_count, 3)
+            restart.assert_called_once()
+            self.assertEqual(restart.call_args.args[0], executable)
             self.assertIs(self.ui.relf_update_helper, helper)
+            self.assertFalse(progress.winfo_ismapped())
+
+    def test_relf_update_failure_clears_progress_and_restores_notice(self):
+        release = RelfUpdate("1.0.0", "", 8, "a" * 64)
+        notice = self.ui.relf_update_button
+        with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
+              patch("shelf_window.check_for_update", return_value=release),
+              patch("shelf_window.confirm_relf_update", return_value=True),
+              patch("shelf_window.prepare_update", side_effect=OSError("Interrupted download"))):
+            self.ui.more_menu.buttons["Check for Relf updates"].invoke()
+            self.wait_for(lambda: self.ui.status.get() == "Could not update Relf: Interrupted download")
+            self.assertFalse(self.ui.download_progress.winfo_manager())
+            self.assertEqual(notice.winfo_manager(), "grid")
+            self.assertTrue(notice.instate(["!disabled"]))
 
     def test_more_menu_cancels_bulk_verification_and_keeps_its_size(self):
         from shelf_cancel import check_canceled
@@ -3628,23 +3702,20 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(ui.empty_panel.winfo_viewable())
         self.assertFalse(ui.reset_search_button.winfo_viewable())
 
-    def test_pending_publication_appears_in_both_actionable_views(self):
+    def test_pending_publication_appears_in_progress_and_actionable_views(self):
         root = self.dest / "alpha"
         root.mkdir(parents=True)
         (root / "pending.json").write_text(json.dumps({
             "version": "2", "release": "1" * 32, "sha256": {},
         }))
         self.ui.more_menu.buttons["Reload"].invoke()
-        for view in ("updates", "attention"):
+        for view in ("updates", "attention", "progress"):
             self.ui.nav_buttons[view].invoke()
             self.root.update()
             self.assertEqual(self.ui.tree.get_children(), (self.keys[0],))
             self.assertEqual(self.ui.tree.set(self.keys[0], "Status"), "Pending")
 
-        self.ui.nav_buttons["progress"].invoke()
-        self.assertEqual(self.ui.tree.get_children(), ())
-        self.assertEqual(self.ui.view_counts["progress"].get(), "0")
-        self.assertEqual(self.ui.empty_title.get(), "No operations in progress")
+        self.assertEqual(self.ui.view_counts["progress"].get(), "1")
 
     @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
     def test_locked_update_resumes_offline_after_reopening(self):
@@ -3662,7 +3733,7 @@ class DesktopTest(unittest.TestCase):
             self.assertEqual(self.ui.displayed_status(first), waiting)
             self.assertEqual(self.ui.displayed_status(second), "Updated")
             self.assertEqual(live.read_bytes(), b"old")
-            for view in ("updates", "attention"):
+            for view in ("updates", "attention", "progress"):
                 self.ui.select_view(view)
                 self.assertEqual(self.ui.tree.get_children(), (first,))
             self.root.after_cancel(self.ui.publication_timer)
@@ -3673,10 +3744,13 @@ class DesktopTest(unittest.TestCase):
             reopened = ShelfWindow(window, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
             self.assertEqual(reopened.displayed_status(first), waiting)
             self.assertEqual(reopened.results[first].available, "1")
+            reopened.select_view("progress")
+            self.assertEqual(reopened.tree.get_children(), (first,))
 
         with (patch("fetch_sources.read_page") as publisher,
               patch("fetch_sources.open_url") as download):
             self.wait_for(lambda: reopened.displayed_status(first) == "Cached" and not reopened.busy)
+            self.assertEqual(reopened.tree.get_children(), ())
             publisher.assert_not_called()
             download.assert_not_called()
         self.assertEqual(live.read_bytes(), b"fixture")

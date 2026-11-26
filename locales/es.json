@@ -211,6 +211,8 @@
   "Unknown": "Desconocido",
   "Pending": "Pendiente",
   "Waiting for the app to close": "Esperando a que se cierre la aplicación",
+  "Downgrade skipped": "Se omitió la vuelta a una versión anterior",
+  "Kept version {installed} because {offered} is older.": "Se conservó la versión {installed} porque {offered} es anterior.",
   "Error": "Error",
   "Latest": "Al día",
   "Updated": "Actualizada",

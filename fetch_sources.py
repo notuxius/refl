@@ -138,8 +138,8 @@ def open_url(url, *, method=None, data=None, headers=None):
             return response
 
 
-def read_page(url):
-    with open_url(url) as response:
+def read_page(url, *, headers=None):
+    with open_url(url, headers=headers) as response:
         body = bytearray()
         for chunk in read_chunks(response):
             body.extend(chunk)

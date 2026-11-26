@@ -42,7 +42,7 @@ def relf_executable():
 def check_for_update():
     token = defer_github_checks.set(True)
     try:
-        release = json.loads(read_page(LATEST_RELEASE))
+        release = json.loads(read_page(LATEST_RELEASE, headers={"Cache-Control": "no-cache"}))
     except HTTPError as exc:
         if exc.code == 404:
             return None
@@ -74,20 +74,20 @@ def check_for_update():
     return RelfUpdate(version, notes, size, sha256(checksum))
 
 
-def download_update(update, staged):
+def download_update(update, staged, *, on_progress=None):
     url = f"{RELEASE_DOWNLOAD}/v{update.version}/{EXE_NAME}"
     with open_url(url) as response, staged.open("xb") as target:
-        write_chunks(read_chunks(response), target, update.size, None)
+        write_chunks(read_chunks(response), target, update.size, on_progress)
     if staged.stat().st_size != update.size or digest(staged) != update.checksum:
         raise ValueError("The downloaded Relf.exe did not pass SHA-256 verification.")
     if windows_product_version(staged) != update.version:
         raise ValueError("The downloaded Relf.exe version does not match the GitHub release.")
 
 
-def prepare_update(executable, update):
+def prepare_update(executable, update, *, on_progress=None):
     stage = Path(tempfile.mkdtemp(prefix=".relf-update-", dir=executable.parent))
     try:
-        download_update(update, stage / EXE_NAME)
+        download_update(update, stage / EXE_NAME, on_progress=on_progress)
         # PyInstaller one-file builds run both a launcher and a GUI process.
         return start_update_helper(executable, stage, (os.getpid(), os.getppid()), sys.argv[1:])
     except Exception:

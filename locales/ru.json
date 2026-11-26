@@ -211,6 +211,8 @@
   "Unknown": "Неизвестно",
   "Pending": "Ожидает",
   "Waiting for the app to close": "Ожидание закрытия приложения",
+  "Downgrade skipped": "Понижение версии пропущено",
+  "Kept version {installed} because {offered} is older.": "Версия {installed} сохранена, поскольку {offered} — более ранняя версия.",
   "Error": "Ошибка",
   "Latest": "Актуальная версия",
   "Updated": "Обновлено",

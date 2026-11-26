@@ -300,7 +300,6 @@ class ShelfWindow:
         self.publication_timer = None
         self.relf_update_timer = None
         self.relf_checking = self.relf_check_manual = False
-        self.relf_update = None
         root.title("Relf")
         if sys.platform == "win32":
             root.iconbitmap(default=str(ASSETS / "relf.ico"))
@@ -453,7 +452,6 @@ class ShelfWindow:
             self.nav_buttons[name] = button
             self.icon_widgets[button] = (nav_icons[name], "text", 20)
             count = ttk.Label(button, textvariable=self.view_counts[name], style="Count.Nav.TLabel")
-            count.place(relx=1, rely=0.5, x=-10, anchor="e")
             bind_button_badge(button, count, lambda n=name: self.sync_nav_count(n))
             self.nav_counts[name] = count
 
@@ -551,6 +549,8 @@ class ShelfWindow:
         label, badge = self.sidebar_labels[button]
         caption = tr(label)
         if self.sidebar_compact:
+            if badge is not None:
+                badge.place_forget()
             button.configure(text=caption, padding="")
             return
         # Leave the icon at the same inset on every row. Only the caption shrinks.
@@ -566,6 +566,12 @@ class ShelfWindow:
             gap = int(self.style.lookup("Nav.TButton", "space"))
             # The focus element takes one pixel on either side.
             width = available - 2 - padding[0] - right - self.images[button][0].width() - gap
+            # Expansion changes the button style before it has room for the badge.
+            if badge is not None:
+                if width < 0:
+                    badge.place_forget()
+                elif not badge.winfo_manager():
+                    badge.place(relx=1, rely=0.5, x=-10, anchor="e")
             caption = fit_text(button, font, caption, width)
         if caption != button["text"]:
             button.configure(text=caption)
@@ -630,15 +636,11 @@ class ShelfWindow:
         self.category_list.column("#0", width=icon_width, minwidth=icon_width)
         self.sync_category_scroll(*self.category_list.yview())
         self.position_categories()
-        for count in self.nav_counts.values():
-            if compact:
-                count.place_forget()
-            else:
-                count.place(relx=1, rely=0.5, x=-10, anchor="e")
         self.sidebar_toggle.configure(text=tr("Expand sidebar" if compact else "Collapse sidebar"))
         self.icon_widgets[self.sidebar_toggle] = ("expand" if compact else "collapse", "text", 20)
         self.refresh_icon(self.sidebar_toggle)
-        self.root.update_idletasks()
+        if compact:
+            self.root.update_idletasks()
         width = self.sidebar.winfo_reqwidth() if compact else self.expanded_sidebar_width
         self.panes.paneconfigure(self.sidebar, width=width, minsize=0 if compact else 150)
         self.panes.configure(sashwidth=0 if compact else 1)
@@ -647,11 +649,8 @@ class ShelfWindow:
         if self.category_groups:
             self.categories_button.grid()
             self.sync_categories_button()
-            if self.sidebar_compact:
-                self.categories_arrow.place_forget()
-            else:
+            if not self.sidebar_compact:
                 self.categories_arrow.itemconfigure(self.arrow_glyph, angle=0 if self.categories_expanded else 90)
-                self.categories_arrow.place(relx=1, rely=0.5, x=-10, anchor="e")
         else:
             self.categories_button.grid_remove()
         if self.category_groups and self.categories_expanded:
@@ -1174,7 +1173,7 @@ class ShelfWindow:
         self.download_progress.grid(row=0, column=3, padx=(12, 0))
         self.download_progress.grid_remove()
         self.relf_update_button = ttk.Button(footer, text=tr("Relf update available"),
-                                            style="Footer.Command.TButton", command=self.offer_relf_update)
+                                            style="Footer.Command.TButton", command=self.check_relf_updates)
         self.relf_update_button.grid(row=0, column=4, padx=(12, 0))
         self.relf_update_button.grid_remove()
         ttk.Label(footer, text=f"v{__version__}", style="Small.TLabel").grid(row=0, column=5, padx=(12, 0))
@@ -1187,23 +1186,32 @@ class ShelfWindow:
         self.status_message = message(template, **values)
         self.status.set(tr(self.status_message))
 
-    def run_relf_update_task(self, task, finish):
-        result = Queue()
+    def run_relf_update_task(self, task, finish, *, on_progress=None):
+        events = Queue()
+
+        def report(received, total):
+            events.put(("progress", received, total))
 
         def work():
             try:
-                result.put((task(), None))
+                value = task(report) if on_progress is not None else task()
             except ERRORS as exc:
-                result.put((None, error_detail(exc)))
+                events.put(("done", None, error_detail(exc)))
+            else:
+                events.put(("done", value, None))
 
         def poll():
-            try:
-                value, error = result.get_nowait()
-            except Empty:
-                self.relf_update_timer = self.root.after(50, poll)
-                return
-            self.relf_update_timer = None
-            finish(value, error)
+            while True:
+                try:
+                    kind, value, detail = events.get_nowait()
+                except Empty:
+                    self.relf_update_timer = self.root.after(50, poll)
+                    return
+                if kind == "done":
+                    self.relf_update_timer = None
+                    finish(value, detail)
+                    return
+                on_progress(value, detail)
 
         Thread(target=work, daemon=True).start()
         self.relf_update_timer = self.root.after(50, poll)
@@ -1229,7 +1237,6 @@ class ShelfWindow:
             if manual and not self.busy:
                 self.set_status("Could not check for Relf updates: {error}", error=error)
             return
-        self.relf_update = update
         if update is None:
             self.relf_update_button.grid_remove()
             if manual and not self.busy:
@@ -1238,19 +1245,13 @@ class ShelfWindow:
             self.relf_update_button.grid()
             if manual and not self.busy:
                 self.set_status("Relf update available")
-                self.offer_relf_update()
+                self.offer_relf_update(update)
 
-    def offer_relf_update(self):
-        if self.busy or self.relf_update is None:
-            return
-        if self.relf_checking:
-            self.relf_check_manual = True
-            return
+    def offer_relf_update(self, update):
         if self.installing or self.editor is not None:
             self.set_status("Close the item editor and let any installs finish before updating Relf.")
             return
         executable = relf_executable()
-        update = self.relf_update
         self.busy = True
         self.controls()
         if not confirm_relf_update(self.root, self.palette, update):
@@ -1258,15 +1259,26 @@ class ShelfWindow:
             self.controls()
             return
         self.set_status("Downloading Relf v{version}…", version=update.version)
-        self.run_relf_update_task(lambda: prepare_update(executable, update), self.finish_relf_install)
+        self.relf_update_button.grid_remove()
+        self.download_progress.update_progress(0, update.size)
+        self.run_relf_update_task(lambda report: prepare_update(executable, update, on_progress=report),
+                                  self.finish_relf_install, on_progress=self.show_relf_update_progress)
+
+    def show_relf_update_progress(self, received, total):
+        if received is None:
+            self.set_status("{action}…", action=message("Verifying"))
+        else:
+            self.download_progress.update_progress(received, total)
 
     def finish_relf_install(self, helper, error):
+        self.download_progress.update_progress(None, None)
         self.busy = False
         if error is None:
             self.relf_update_helper = helper
             self.close()
         else:
             self.set_status("Could not update Relf: {error}", error=error)
+            self.relf_update_button.grid()
             self.controls()
 
     def on_map(self, event):
@@ -2026,7 +2038,9 @@ class ShelfWindow:
                   "all": tuple(key for key, job in self.jobs.items() if isinstance(job, Recipe)),
                   "local": tuple(key for key, job in self.jobs.items() if isinstance(job, LocalItem)),
                   "disabled": {key for key, job in self.jobs.items() if updates_disabled(job)},
-                  "progress": tuple(self.active_items)}
+                  "progress": self.active_items.keys() | self.github_paused | {
+                      key for key, result in self.results.items()
+                      if result.status == "Pending" or self.is_queued_update(key)}}
         for group, statuses in (("updates", {"Update available", "Pending"}),
                                 ("attention", {"Repair needed", "Source error", "Error", "Pending"})):
             groups[group] = tuple(key for key in self.jobs if key not in checklists and self.results[key].status in statuses
@@ -2127,9 +2141,13 @@ class ShelfWindow:
         status = self.results[key].status
         if updates_disabled(self.jobs[key]) and status in ("Unknown", "Update available", "Latest"):
             return tr("Disabled")
-        if status == "Unknown" and key in self.cancel_events and self.requested_action in ("fetch", "install"):
+        if self.is_queued_update(key):
             return tr("Pending")
         return tr(self.results[key].display_status)
+
+    def is_queued_update(self, key):
+        return (self.results[key].status == "Unknown" and key in self.cancel_events
+                and self.requested_action in ("fetch", "install"))
 
     def shows_error(self, key):
         return (key not in self.active_items and key not in self.github_paused

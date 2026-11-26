@@ -211,6 +211,8 @@
   "Unknown": "نامعلوم",
   "Pending": "زیرِ التوا",
   "Waiting for the app to close": "ایپ بند ہونے کا انتظار ہے",
+  "Downgrade skipped": "پرانے ورژن پر واپسی چھوڑ دی گئی",
+  "Kept version {installed} because {offered} is older.": "ورژن {installed} برقرار رکھا گیا کیونکہ {offered} اس سے پرانا ہے۔",
   "Error": "خرابی",
   "Latest": "تازہ ترین",
   "Updated": "اپ ڈیٹ ہو گئی",

@@ -211,6 +211,8 @@
   "Unknown": "未知",
   "Pending": "等待中",
   "Waiting for the app to close": "正在等待应用关闭",
+  "Downgrade skipped": "已跳过降级",
+  "Kept version {installed} because {offered} is older.": "已保留版本 {installed}，因为 {offered} 是更早的版本。",
   "Error": "错误",
   "Latest": "已是最新",
   "Updated": "已更新",
