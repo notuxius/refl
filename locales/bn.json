@@ -186,6 +186,8 @@
   "Update and restart": "আপডেট করে আবার চালু করুন",
   "Self-updates are available in the Windows Relf executable.": "Windows-এর Relf এক্সিকিউটেবলে স্বয়ংক্রিয় আপডেট উপলব্ধ।",
   "Checking for Relf updates…": "Relf-এর আপডেট খোঁজা হচ্ছে…",
+  "Last checked release: v{version}": "সর্বশেষ যাচাই করা সংস্করণ: v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub আপডেট যাচাইয়ের সংখ্যা সীমিত করছে। পরে আবার চেষ্টা করুন।",
   "Could not check for Relf updates: {error}": "Relf-এর আপডেট খোঁজা যায়নি: {error}",
   "Relf is up to date.": "Relf-এর সর্বশেষ সংস্করণ চলছে।",
   "Close the item editor and let any installs finish before updating Relf.": "Relf আপডেট করার আগে আইটেম সম্পাদক বন্ধ করুন এবং চলমান ইনস্টলেশন শেষ হওয়া পর্যন্ত অপেক্ষা করুন।",

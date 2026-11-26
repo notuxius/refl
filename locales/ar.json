@@ -186,6 +186,8 @@
   "Update and restart": "التحديث وإعادة التشغيل",
   "Self-updates are available in the Windows Relf executable.": "يتوفر التحديث الذاتي في ملف Relf التنفيذي لنظام Windows.",
   "Checking for Relf updates…": "جارٍ التحقق من تحديثات Relf…",
+  "Last checked release: v{version}": "آخر إصدار تم التحقق منه: v{version}",
+  "GitHub is limiting update checks. Try again later.": "يحدّ GitHub من عمليات التحقق من التحديثات. حاول مرة أخرى لاحقًا.",
   "Could not check for Relf updates: {error}": "تعذّر التحقق من تحديثات Relf: {error}",
   "Relf is up to date.": "Relf محدّث.",
   "Close the item editor and let any installs finish before updating Relf.": "أغلق محرر العناصر وانتظر اكتمال أي عمليات تثبيت قبل تحديث Relf.",

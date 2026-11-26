@@ -186,6 +186,8 @@
   "Update and restart": "更新して再起動",
   "Self-updates are available in the Windows Relf executable.": "Windows 版 Relf の実行ファイルでは自己更新が可能です。",
   "Checking for Relf updates…": "Relf の更新を確認中…",
+  "Last checked release: v{version}": "前回の確認で見つかったバージョン：v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub が更新の確認回数を制限しています。しばらくしてからもう一度お試しください。",
   "Could not check for Relf updates: {error}": "Relf の更新を確認できませんでした：{error}",
   "Relf is up to date.": "Relf は最新です。",
   "Close the item editor and let any installs finish before updating Relf.": "Relf を更新する前に、項目エディターを閉じて、実行中のインストールが完了するまでお待ちください。",

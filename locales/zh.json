@@ -186,6 +186,8 @@
   "Update and restart": "更新并重启",
   "Self-updates are available in the Windows Relf executable.": "Relf 的 Windows 可执行文件支持自我更新。",
   "Checking for Relf updates…": "正在检查 Relf 更新…",
+  "Last checked release: v{version}": "上次检查到的版本：v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub 正在限制更新检查次数。请稍后重试。",
   "Could not check for Relf updates: {error}": "无法检查 Relf 更新：{error}",
   "Relf is up to date.": "Relf 已是最新版本。",
   "Close the item editor and let any installs finish before updating Relf.": "请关闭条目编辑器，并等待正在进行的安装完成后再更新 Relf。",

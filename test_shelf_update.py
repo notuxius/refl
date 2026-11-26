@@ -11,9 +11,11 @@ import tempfile
 from time import monotonic, sleep
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
-from shelf_update import (LATEST_RELEASE, RELEASE_DOWNLOAD, RelfUpdate, check_for_update,
-                          download_update, install_update, stage_update, start_update_helper)
+from fetch_sources import GitHubRateLimited
+from shelf_update import (LATEST_RELEASE, RELEASE_DOWNLOAD, RelfUpdate, RelfUpdateRateLimited, check_for_update,
+                          download_update, install_update, read_cached_release, stage_update, start_update_helper)
 
 
 class UpdateTest(unittest.TestCase):
@@ -24,15 +26,34 @@ class UpdateTest(unittest.TestCase):
                                "digest": f"sha256:{checksum}"}]}
         with (patch("shelf_update.__version__", "0.9.0"),
               patch("shelf_update.read_page", return_value=json.dumps(release)) as page):
-            self.assertEqual(check_for_update(), RelfUpdate("0.10.0", "- Release notes", 123, checksum))
+            self.assertEqual(check_for_update(),
+                             ("0.10.0", RelfUpdate("0.10.0", "- Release notes", 123, checksum)))
             page.assert_called_once_with(LATEST_RELEASE, headers={"Cache-Control": "no-cache"})
-            for fields in ({"tag_name": "v0.8.0"}, {"tag_name": "v0.9.0"}, {"prerelease": True}, {"draft": True}):
+            for fields, version in (({"tag_name": "v0.8.0"}, "0.8.0"), ({"tag_name": "v0.9.0"}, "0.9.0"),
+                                    ({"prerelease": True}, None), ({"draft": True}, None)):
                 page.return_value = json.dumps(release | fields)
-                self.assertIsNone(check_for_update())
+                self.assertEqual(check_for_update(), (version, None))
             for asset in ({"name": "anything.exe"}, {"state": "new"}, {"digest": None}, {"digest": "sha256:abcd"}):
                 page.return_value = json.dumps(release | {"assets": [release["assets"][0] | asset]})
                 with self.assertRaises(ValueError):
                     check_for_update()
+
+    def test_update_check_reports_github_rate_limit(self):
+        for error in (GitHubRateLimited(), HTTPError(LATEST_RELEASE, 429, "Too Many Requests", {}, None)):
+            with (patch("shelf_update.read_page", side_effect=error),
+                  self.assertRaisesRegex(RelfUpdateRateLimited, "GitHub is limiting update checks")):
+                check_for_update()
+
+    def test_cached_release_requires_a_newer_version_and_valid_download_metadata(self):
+        valid = {"version": "1.0.0", "notes": "", "size": 123, "checksum": "a" * 64}
+        with tempfile.TemporaryDirectory() as tmp, patch("shelf_update.__version__", "0.45.2"):
+            path = Path(tmp) / "latest-relf-release.json"
+            path.write_text(json.dumps(valid), encoding="utf-8")
+            self.assertEqual(read_cached_release(path), ("1.0.0", RelfUpdate(**valid)))
+            for fields, version in (({"version": "0.45.2"}, "0.45.2"), ({"version": "../v1.0.0"}, None),
+                                    ({"checksum": "bad"}, "1.0.0"), ({"size": -1}, "1.0.0")):
+                path.write_text(json.dumps(valid | fields), encoding="utf-8")
+                self.assertEqual(read_cached_release(path), (version, None))
 
     def test_download_checks_sha256_and_executable_version(self):
         payload = b"new relf"

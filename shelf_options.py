@@ -55,11 +55,11 @@ class OptionsWindow(tk.Toplevel):
         downloads = ttk.Frame(body)
         downloads.pack(fill="x", pady=(6, 12))
         downloads.columnconfigure(0, weight=1)
-        ttk.Entry(downloads, textvariable=self.download_folder, state="readonly", width=12).grid(
-            row=0, column=0, sticky="ew")
+        ttk.Entry(downloads, textvariable=self.download_folder, state="readonly",
+                  width=12, style="DownloadFolder.TEntry").grid(row=0, column=0, sticky="nsew")
         self.browse_button = ttk.Button(downloads, command=self.choose_download_folder)
         self.browse_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
-        self.download_hint = ttk.Label(downloads, wraplength=390, style="Small.TLabel")
+        self.download_hint = ttk.Label(downloads, wraplength=390, style="Muted.TLabel", font=("Segoe UI", 9))
         self.download_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         self.appearance_heading = ttk.Label(body, font=heading_font)
@@ -141,7 +141,15 @@ class OptionsWindow(tk.Toplevel):
 
     def update_download_hint(self):
         pending = Path(self.download_folder.get()) != self.destination
-        self.download_hint.configure(text=tr("Restart Relf to use the selected folder.") if pending else "")
+        if pending:
+            self.download_hint.configure(text=tr("Restart Relf to use the selected folder."))
+            self.download_hint.grid()
+        else:
+            self.download_hint.grid_remove()
+        if self.winfo_ismapped():
+            self.update_idletasks()
+            if self.winfo_reqheight() != self.winfo_height():
+                initial_geometry(self, self.winfo_width(), self.winfo_reqheight(), parent=self.master)
 
     def apply_theme(self, palette):
         self.palette = palette

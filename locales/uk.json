@@ -186,6 +186,8 @@
   "Update and restart": "Оновити й перезапустити",
   "Self-updates are available in the Windows Relf executable.": "Самооновлення доступне у виконуваному файлі Relf для Windows.",
   "Checking for Relf updates…": "Перевіряємо оновлення Relf…",
+  "Last checked release: v{version}": "Остання версія, знайдена під час перевірки: v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub обмежує частоту перевірок оновлень. Спробуйте пізніше.",
   "Could not check for Relf updates: {error}": "Не вдалося перевірити оновлення Relf: {error}",
   "Relf is up to date.": "Установлено найновішу версію Relf.",
   "Close the item editor and let any installs finish before updating Relf.": "Перед оновленням Relf закрийте редактор елементів і дочекайтеся завершення всіх установлень.",

@@ -229,24 +229,25 @@ def bind_button_badge(button, badge, sync):
         badge.bind(event, lambda e, seq=event: button.event_generate(
             seq, x=e.x_root - button.winfo_rootx(), y=e.y_root - button.winfo_rooty(), state=e.state))
     # ttk's class bindings set the button state after widget bindings run.
-    for event in ("<Enter>", "<Leave>", "<ButtonPress-1>", "<ButtonRelease-1>", "<space>", "<<Invoke>>"):
+    for event in ("<Enter>", "<Leave>", "<FocusIn>", "<FocusOut>",
+                  "<ButtonPress-1>", "<ButtonRelease-1>", "<space>", "<<Invoke>>"):
         button.bind(event, lambda _: button.after_idle(sync), add="+")
 
 def style_dropdowns(style, palette):
     combo_arrow = "Relf.comboArrow"
     down, up = "RelfDropdownDown", "RelfDropdownUp"
-    field, focus = "RelfComboField", "RelfComboFocus"
+    field, hover, focus = "RelfComboField", "RelfComboHover", "RelfComboFocus"
     if combo_arrow not in style.element_names():
         # Leave 8 px before the triangle and 12 px between it and the button edge.
         for image in (down, up):
             style.tk.call("image", "create", "photo", image, "-width", 31, "-height", 6)
         style.element_create(combo_arrow, "image", down, ("pressed", up))
         # A square, fully painted field avoids clam's exposed corner pixels.
-        for image in (field, focus):
+        for image in (field, hover, focus):
             style.tk.call("image", "create", "photo", image, "-width", 64, "-height", 32)
         combo_field = "Relf.comboField"
         style.element_create(combo_field, "image", field, ("pressed", focus), ("focus", focus),
-                             ("active", focus), border=1, width=1, height=1, sticky="nsew")
+                             ("active", hover), border=1, width=1, height=1, sticky="nsew")
         style.layout("TCombobox", [(combo_field, {"sticky": "nswe", "children": [
             (combo_arrow, {"side": "right", "sticky": ""}),
             ("Combobox.padding", {"sticky": "nswe", "children": [
@@ -258,9 +259,9 @@ def style_dropdowns(style, palette):
     for row in range(6):
         for image, y in ((down, row), (up, 5 - row)):
             style.tk.call(image, "put", palette.muted, "-to", 8 + row, y, 19 - row, y + 1)
-    for image, outline in ((field, palette.line), (focus, palette.accent)):
-        style.tk.call(image, "put", outline, "-to", 0, 0, 64, 32)
-        style.tk.call(image, "put", palette.surface, "-to", 1, 1, 63, 31)
+    for image, fill in ((field, palette.surface), (hover, palette.subtle), (focus, palette.selection)):
+        style.tk.call(image, "put", palette.line, "-to", 0, 0, 64, 32)
+        style.tk.call(image, "put", fill, "-to", 1, 1, 63, 31)
 
 
 def category_picker(parent, variable, choices, *, width):
@@ -281,7 +282,7 @@ def category_picker(parent, variable, choices, *, width):
 
     def style_popup():
         # Tk builds the popup with a classic listbox outside the ttk style system.
-        call(popup, "configure", "-background", style.lookup("Focus.TFrame", "background"))
+        call(popup, "configure", "-background", style.lookup("Line.TFrame", "background"))
         field.tk.call(f"{popup}.f.l", "configure", "-font", field.cget("font"),
                       "-background", style.lookup("TCombobox", "fieldbackground"),
                       "-foreground", style.lookup("TCombobox", "foreground"),
@@ -296,26 +297,28 @@ def category_picker(parent, variable, choices, *, width):
 def style_editor_tabs(style, palette):
     tab = "Editor.TNotebook.Tab"
     face = "Relf.editorTab"
-    normal, hover, selected = "RelfTabNormal", "RelfTabHover", "RelfTabSelected"
+    normal, hover, selected, focused = "RelfTabNormal", "RelfTabHover", "RelfTabSelected", "RelfTabFocused"
     if face not in style.element_names():
         # Tk tiles the image for every repaint. Cover a typical tab in one or
         # two blits while letting the caption determine the actual tab size.
-        for image in (normal, hover, selected):
+        for image in (normal, hover, selected, focused):
             style.tk.call("image", "create", "photo", image, "-width", 128, "-height", 48)
-        style.element_create(face, "image", normal, ("selected", selected), ("active", hover),
+        style.element_create(face, "image", normal, ("selected", "focus", focused),
+                             ("selected", selected), ("active", hover),
                              width=1, height=4, border=(0, 0, 0, 3), padding=(0, 0, 0, 3), sticky="nsew")
         style.layout(tab, [(face, {"sticky": "nsew", "children": [
             ("Notebook.padding", {"sticky": "nsew", "children": [
                 ("Notebook.focus", {"sticky": "nsew", "children": [
                     ("Notebook.label", {"sticky": ""})]})]})]})])
-    for image, fill in ((normal, palette.canvas), (hover, palette.subtle), (selected, palette.selection)):
+    for image, fill in ((normal, palette.canvas), (hover, palette.subtle),
+                        (selected, palette.selection), (focused, palette.line)):
         style.tk.call(image, "put", fill, "-to", 0, 0, 128, 48)
-    style.tk.call(selected, "put", palette.tab_indicator or palette.accent, "-to", 0, 45, 128, 48)
+    for image in (selected, focused):
+        style.tk.call(image, "put", palette.tab_indicator or palette.accent, "-to", 0, 45, 128, 48)
     style.configure("Editor.TNotebook", tabmargins=0, background=palette.canvas, bordercolor=palette.line,
                     lightcolor=palette.canvas, darkcolor=palette.canvas)
     padding = (15, 8)
-    style.configure(tab, padding=padding, font=("Segoe UI Semibold", 10), foreground=palette.muted,
-                    focuscolor=palette.muted)
+    style.configure(tab, padding=padding, font=("Segoe UI Semibold", 10), foreground=palette.muted)
     # Clam normally changes the padding on selection, which moves the neighboring tabs.
     style.map(tab, padding=[("selected", padding)], foreground=[("selected", palette.text), ("active", palette.text)])
 
@@ -323,11 +326,10 @@ def style_editor_tabs(style, palette):
 def style_widgets(s, p):
     s.configure(".", background=p.canvas, foreground=p.text, font=("Segoe UI", 10),
                 bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface,
-                troughcolor=p.canvas, focuscolor=p.accent, focussolid=True)
+                troughcolor=p.canvas, focusthickness=0)
     s.configure("Surface.TFrame", background=p.surface)
     s.configure("TSizegrip", background=p.surface)
     s.configure("Line.TFrame", background=p.line)
-    s.configure("Focus.TFrame", background=p.accent)
     s.configure("Sidebar.TFrame", background=p.subtle)
     s.configure("SidebarHint.TLabel", background=p.text, foreground=p.surface, padding=(7, 4),
                 font=("Segoe UI", 9))
@@ -338,18 +340,31 @@ def style_widgets(s, p):
     s.configure("Muted.TLabel", foreground=p.muted)
     s.configure("EditorError.TLabel", foreground=p.error)
     s.configure("TEntry", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
-                selectbackground=p.selection, selectforeground=p.text, padding=5)
+                selectbackground=p.selection, selectforeground=p.text, lightcolor=p.line, padding=5)
+    s.map("TEntry", bordercolor=[], lightcolor=[],
+          fieldbackground=[("disabled", p.subtle), ("focus", p.selection)])
+    folder_entry = "DownloadFolder.TEntry"
+    folder_field = "Relf.folderField"
+    if folder_field not in s.element_names():
+        s.element_create(folder_field, "from", "alt", "Entry.field")
+        s.layout(folder_entry, [(folder_field, {"sticky": "nsew", "border": 1, "children": [
+            ("Entry.padding", {"sticky": "nsew", "children": [
+                ("Entry.textarea", {"sticky": "nsew"})]})]})])
+    s.configure(folder_entry, focuswidth=1, focuscolor=p.accent)
+    s.map(folder_entry, fieldbackground=[("readonly", p.surface)],
+          selectbackground=[("focus", p.accent), ("!focus", p.selection)],
+          selectforeground=[("focus", p.on_accent), ("!focus", p.text)])
     s.configure("TCombobox", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
                 selectbackground=p.selection, selectforeground=p.text, padding=(8, 6),
                 postoffset=(0, 1, 0, -2))  # Overlap the field outline by 1 px in either direction.
-    # Blend clam's bevel and inner focus ring into the fill. Only the outer
-    # border changes color on hover or keyboard focus for every dropdown.
+    s.map("TCombobox", fieldbackground=[("disabled", p.subtle), ("focus", p.selection)], foreground=[])
+    # Blend clam's bevel into the fill and keep the dropdown edge neutral.
     s.configure("TMenubutton", padding=(10, 7, "23p", 7), background=p.surface, borderwidth=1,
-                bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface, focuscolor=p.surface)
-    menu_fill = [("disabled", p.subtle), ("selected", p.surface), ("pressed", p.selection), ("active", p.subtle)]
+                bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface)
+    menu_fill = [("disabled", p.subtle), ("selected", p.surface), ("pressed", p.selection),
+                 ("focus", p.selection), ("active", p.subtle)]
     s.map("TMenubutton", background=menu_fill, lightcolor=menu_fill, darkcolor=menu_fill,
-          focuscolor=menu_fill, foreground=[("disabled", p.muted)],
-          bordercolor=[("disabled", p.line), ("selected", p.line), ("focus", p.accent), ("active", p.accent)])
+          foreground=[("disabled", p.muted)])
     s.configure("DropdownArrow.TLabel", font=HEADING_FONT, foreground=p.muted, background=p.surface)
     s.map("DropdownArrow.TLabel", background=menu_fill)
     style_dropdowns(s, p)
@@ -357,11 +372,11 @@ def style_widgets(s, p):
     s.configure("LanguagePicker.TMenubutton", space=9, font=("Segoe UI Semibold", 10))
     s.layout("LanguageItem.TButton", [("Button.border", {"sticky": "nsew", "border": 1,
               "children": [("Button.padding", {"sticky": "nsew"})]})])
-    item_fill = [("selected", p.selection), ("focus", p.subtle)]
+    item_fill = [("focus", p.line), ("selected", p.selection)]
     s.configure("LanguageItem.TButton", padding=(3, 4), background=p.surface, bordercolor=p.surface,
                 lightcolor=p.surface, darkcolor=p.surface, relief="solid", borderwidth=1)
     s.map("LanguageItem.TButton", background=item_fill, lightcolor=item_fill, darkcolor=item_fill,
-          bordercolor=[("focus", p.accent), ("selected", p.selection)])
+          bordercolor=item_fill)
     for style, face, size, ink in (("Native", "Segoe UI Semibold", 10, p.text),
                                    ("English", "Segoe UI", 9, p.muted),
                                    ("Check", "Segoe UI Symbol", 11, p.accent)):
@@ -373,6 +388,9 @@ def style_widgets(s, p):
     ]})])
     # Leave room for the clear icon inside the entry's right edge.
     s.configure("Search.TEntry", background=p.surface, fieldbackground=p.surface, padding=(2, 5, 26, 5))
+    for style in ("Search.TEntry", "Search.Surface.TFrame", "Search.Small.TLabel"):
+        s.map(style, background=[("alternate", p.selection)])
+    s.map("Search.Command.TButton", background=[("alternate", "!focus", "!pressed", "!active", p.selection)])
     style_editor_tabs(s, p)
     s.configure("Small.TLabel", background=p.surface, foreground=p.muted, font=("Segoe UI", 9))
     progress_fill = p.tab_indicator or p.accent
@@ -380,37 +398,31 @@ def style_widgets(s, p):
                 bordercolor=p.line, lightcolor=progress_fill, darkcolor=progress_fill, thickness=8)
     s.configure("Detail.TLabel", background=p.surface, font=("Segoe UI Semibold", 13))
     s.configure("TButton", background=p.surface, padding=(12, 7), borderwidth=1, relief="flat")
-    s.map("TButton", background=[("disabled", p.subtle), ("pressed", p.selection), ("active", p.subtle)],
-          foreground=[("disabled", p.muted)], bordercolor=[("focus", p.accent)])
+    s.map("TButton", background=[("disabled", p.subtle), ("pressed", p.selection), ("focus", p.selection),
+                                 ("active", p.subtle)], foreground=[("disabled", p.muted)], bordercolor=[])
     s.configure("Primary.TButton", background=p.accent, foreground=p.on_accent, width=-1, space=7,
                 font=("Segoe UI Semibold", 10), bordercolor=p.accent, lightcolor=p.accent, darkcolor=p.accent)
-    primary_fill = [("disabled", p.subtle), ("pressed", p.hover_accent), ("active", p.hover_accent)]
+    primary_fill = [("disabled", p.subtle), ("pressed", p.hover_accent), ("focus", p.hover_accent),
+                    ("active", p.hover_accent)]
     s.map("Primary.TButton", background=primary_fill, foreground=[("disabled", p.muted)],
-          bordercolor=[("focus", p.text), *primary_fill],
+          bordercolor=primary_fill,
           lightcolor=primary_fill, darkcolor=primary_fill)
 
-    # Use flat labels inside command and navigation buttons. Keep the focus
-    # element so keyboard navigation still has a visible outline.
-    flat_button = [("Button.focus", {"sticky": "nswe", "children": [
-        ("Button.padding", {"sticky": "nswe", "children": [
-            ("Button.label", {"sticky": "nswe"})
-        ]})
+    flat_button = [("Button.padding", {"sticky": "nswe", "children": [
+        ("Button.label", {"sticky": "nswe"})
     ]})]
     s.layout("Command.TButton", flat_button)
     s.configure("Command.TButton", width=-1, background=p.surface, space=6, padding=(8, 7))
-    s.map("Command.TButton", background=[("disabled", p.surface), ("pressed", p.selection), ("active", p.subtle)],
-          foreground=[("disabled", p.muted)])
+    s.map("Command.TButton", background=[("disabled", p.surface), ("pressed", p.selection),
+                                         ("focus", p.line), ("active", p.subtle)], foreground=[("disabled", p.muted)])
     s.configure("Footer.Command.TButton", font=s.lookup("Small.TLabel", "font"))
-    s.layout("AppMenu.TButton", [("Button.padding", {"sticky": "nswe", "children": [
-        ("Button.label", {"sticky": "nswe"})
-    ]})])
+    s.layout("AppMenu.TButton", flat_button)
     s.configure("AppMenu.TButton", anchor="w", width=-1, padding=(11, 7, 22, 7), space=10,
                 background=p.surface, foreground=p.text)
     s.map("AppMenu.TButton", background=[("disabled", p.surface), ("focus", p.selection)],
           foreground=[("disabled", p.muted)])
     style_checkboxes(s, p)
-    s.configure("AppMenu.TCheckbutton", padding=(7, 6, 16, 6), background=p.surface,
-                foreground=p.text, focuscolor=p.selection)
+    s.configure("AppMenu.TCheckbutton", padding=(7, 6, 16, 6), background=p.surface, foreground=p.text)
     s.map("AppMenu.TCheckbutton", background=[("focus", p.selection), ("active", p.selection)],
           foreground=[("disabled", p.muted)])
     s.configure("Options.TCheckbutton", padding=(0, 3))
@@ -419,16 +431,20 @@ def style_widgets(s, p):
     s.configure("Nav.TButton", background=p.subtle, anchor="w", width=-1, space=9,
                 padding=(NAV_ICON_INSET, 9, 38, 9))
     s.configure("Compact.Nav.TButton", anchor="center", width=-1, padding=(NAV_ICON_INSET, 9))
-    nav_background = [("disabled", p.subtle), ("selected", p.selection), ("pressed", p.selection), ("active", p.surface)]
+    # Keep the selected hue visible when the same item also has keyboard focus.
+    base_rgb, text_rgb = s.master.winfo_rgb(p.selection), s.master.winfo_rgb(p.text)
+    selected_focus = "#" + "".join(f"{(4 * base + ink) // (5 * 257):02x}" for base, ink in zip(base_rgb, text_rgb))
+    nav_background = [("disabled", p.subtle), ("selected", "focus", selected_focus), ("selected", p.selection),
+                      ("pressed", p.selection), ("focus", p.line), ("active", p.surface)]
     nav_foreground = [("disabled", p.line), ("selected", p.text)]
     s.map("Nav.TButton", background=nav_background, foreground=nav_foreground)
     s.configure("Count.Nav.TLabel", background=p.subtle, foreground=p.muted, font=("Segoe UI Semibold", 9))
     s.map("Count.Nav.TLabel", background=nav_background, foreground=nav_foreground)
     s.configure("Theme.Toolbutton", background=p.subtle, foreground=p.muted,
                 padding=(11, 5), space=6, relief="flat", borderwidth=0)
-    s.map("Theme.Toolbutton", background=[("selected", p.accent), ("active", p.selection)],
-          foreground=[("selected", p.on_accent), ("active", p.text)], relief=[("selected", "flat")],
-          focuscolor=[("selected", p.on_accent), ("focus", p.text)])
+    s.map("Theme.Toolbutton", background=[("selected", "focus", p.hover_accent), ("selected", p.accent),
+                                          ("focus", p.line), ("active", p.selection)],
+          foreground=[("selected", p.on_accent), ("focus", p.text), ("active", p.text)], relief=[])
     s.configure("Palette.Theme.Toolbutton", anchor="w", padding=(8, 7), space=8,
                 background=p.surface, foreground=p.text)
     # The enclosing card supplies the one-pixel border around the table.

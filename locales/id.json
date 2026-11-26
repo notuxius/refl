@@ -186,6 +186,8 @@
   "Update and restart": "Perbarui dan mulai ulang",
   "Self-updates are available in the Windows Relf executable.": "Berkas EXE Relf untuk Windows dapat memperbarui dirinya sendiri.",
   "Checking for Relf updates…": "Memeriksa pembaruan Relf…",
+  "Last checked release: v{version}": "Versi terakhir yang ditemukan: v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub membatasi pemeriksaan pembaruan. Coba lagi nanti.",
   "Could not check for Relf updates: {error}": "Tidak dapat memeriksa pembaruan Relf: {error}",
   "Relf is up to date.": "Relf sudah menggunakan versi terbaru.",
   "Close the item editor and let any installs finish before updating Relf.": "Tutup editor item dan tunggu hingga instalasi selesai sebelum memperbarui Relf.",

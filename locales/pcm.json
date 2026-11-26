@@ -186,6 +186,8 @@
   "Update and restart": "Update and open again",
   "Self-updates are available in the Windows Relf executable.": "Relf fit update itself from im Windows EXE file.",
   "Checking for Relf updates…": "We dey check for Relf update…",
+  "Last checked release: v{version}": "Version wey Relf see last time: v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub dey limit how many times Relf fit check for update. Try again later.",
   "Could not check for Relf updates: {error}": "We no fit check for Relf update: {error}",
   "Relf is up to date.": "You dey use di latest Relf.",
   "Close the item editor and let any installs finish before updating Relf.": "Close di item editor and wait make any installation finish before you update Relf.",

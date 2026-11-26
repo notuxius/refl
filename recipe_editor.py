@@ -398,7 +398,7 @@ class RecipeEditor(tk.Toplevel):
         self.text_area.configure(bg=palette.surface, fg=palette.text, insertbackground=palette.text,
                                  selectbackground=palette.selection, selectforeground=palette.text,
                                  highlightthickness=1, highlightbackground=palette.line,
-                                 highlightcolor=palette.accent, relief="flat", padx=5, pady=3)
+                                 highlightcolor=palette.line, relief="flat", padx=5, pady=3)
         if self.detail is not None:
             self.detail.tag_configure("error", foreground=palette.error)
             self.detail.configure(bg=palette.surface, fg=palette.text, insertbackground=palette.text,

@@ -209,7 +209,7 @@ class ChecklistWindow(tk.Toplevel):
         for field in (self.description, self.script):
             field.configure(bg=palette.surface, fg=palette.text, insertbackground=palette.text,
                             selectbackground=palette.selection, selectforeground=palette.text, relief="flat",
-                            highlightthickness=1, highlightbackground=palette.line, highlightcolor=palette.accent,
+                            highlightthickness=1, highlightbackground=palette.line, highlightcolor=palette.line,
                             padx=6, pady=4)
         if self.winfo_ismapped():
             style_titlebar(self, palette.is_dark)

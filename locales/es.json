@@ -186,6 +186,8 @@
   "Update and restart": "Actualizar y reiniciar",
   "Self-updates are available in the Windows Relf executable.": "La aplicación ejecutable de Relf para Windows puede actualizarse por sí sola.",
   "Checking for Relf updates…": "Buscando actualizaciones de Relf…",
+  "Last checked release: v{version}": "Última versión consultada: v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub está limitando las comprobaciones de actualizaciones. Vuelve a intentarlo más tarde.",
   "Could not check for Relf updates: {error}": "No se pudieron buscar actualizaciones de Relf: {error}",
   "Relf is up to date.": "Relf está al día.",
   "Close the item editor and let any installs finish before updating Relf.": "Cierra el editor de elementos y espera a que terminen las instalaciones antes de actualizar Relf.",

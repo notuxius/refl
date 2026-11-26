@@ -46,5 +46,5 @@ def style_checkboxes(style, palette):
             ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
                 ("Checkbutton.label", {"sticky": "nsew"})]})]})])
     style.configure("TCheckbutton", background=palette.canvas, foreground=palette.text)
-    style.map("TCheckbutton", background=[("active", palette.canvas)],
+    style.map("TCheckbutton", background=[("focus", palette.line), ("active", palette.canvas)],
               foreground=[("disabled", palette.muted)])

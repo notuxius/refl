@@ -17,12 +17,19 @@ from urllib.error import HTTPError
 from fetch_sources import (GitHubRateLimited, defer_github_checks, digest, open_url, read_page,
                            sha256, windows_product_version, write_chunks)
 from shelf_cancel import cancel_scope, publisher_items, read_chunks
+from shelf_message import message
 from shelf_version import __version__
 
 
 LATEST_RELEASE = "https://api.github.com/repos/notuxius/refl/releases/latest"
 RELEASE_DOWNLOAD = "https://github.com/notuxius/refl/releases/download"
 EXE_NAME = "Relf.exe"
+RELF_VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+
+
+class RelfUpdateRateLimited(ValueError):
+    def __init__(self):
+        super().__init__(message("GitHub is limiting update checks. Try again later."))
 
 
 @dataclass(frozen=True)
@@ -33,6 +40,35 @@ class RelfUpdate:
     checksum: str
 
 
+def is_newer_version(version):
+    return tuple(map(int, version.split("."))) > tuple(map(int, __version__.split(".")))
+
+
+def checked_update(version, notes, size, checksum):
+    if type(size) is not int or size <= 0:
+        raise ValueError("The GitHub release is missing verification information for Relf.exe.")
+    if not isinstance(notes, str):
+        raise ValueError("The GitHub release notes could not be read.")
+    return RelfUpdate(version, notes, size, sha256(checksum))
+
+
+def read_cached_release(path):
+    try:
+        release = json.loads(path.read_text(encoding="utf-8"))
+        version = release["version"]
+        if not RELF_VERSION.fullmatch(version):
+            return None, None
+        newer = is_newer_version(version)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None, None
+    if newer and "size" in release:
+        try:
+            return version, checked_update(version, release["notes"], release["size"], release["checksum"])
+        except (ValueError, TypeError, KeyError):
+            pass
+    return version, None
+
+
 def relf_executable():
     if sys.platform == "win32" and getattr(sys, "frozen", False):
         return Path(sys.executable).resolve()
@@ -40,38 +76,37 @@ def relf_executable():
 
 
 def check_for_update():
+    """Return the latest checked version and an update if it is newer."""
     token = defer_github_checks.set(True)
     try:
         release = json.loads(read_page(LATEST_RELEASE, headers={"Cache-Control": "no-cache"}))
     except HTTPError as exc:
         if exc.code == 404:
-            return None
+            return None, None
+        if exc.code == 429:
+            raise RelfUpdateRateLimited() from exc
         raise
     except GitHubRateLimited as exc:
-        raise ValueError("GitHub is limiting update checks. Try again later.") from exc
+        raise RelfUpdateRateLimited() from exc
     finally:
         defer_github_checks.reset(token)
     if release.get("draft") or release.get("prerelease"):
-        return None
-    tag = re.fullmatch(r"v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))", release["tag_name"])
-    if not tag:
+        return None, None
+    tag = release["tag_name"]
+    if not isinstance(tag, str) or not tag.startswith("v") or not RELF_VERSION.fullmatch(tag[1:]):
         raise ValueError("The GitHub release has an invalid Relf version.")
-    version = tag[1]
-    if tuple(map(int, version.split("."))) <= tuple(map(int, __version__.split("."))):
-        return None
+    version = tag[1:]
+    if not is_newer_version(version):
+        return version, None
     assets = [asset for asset in release["assets"]
               if asset["name"] == EXE_NAME and asset["state"] == "uploaded"]
     if len(assets) != 1:
         raise ValueError("The GitHub release must include one Relf.exe.")
     asset, = assets
-    size = asset["size"]
     algorithm, _, checksum = (asset.get("digest") or "").partition(":")
-    if algorithm != "sha256" or type(size) is not int or size <= 0:
+    if algorithm != "sha256":
         raise ValueError("The GitHub release is missing verification information for Relf.exe.")
-    notes = release.get("body") or ""
-    if not isinstance(notes, str):
-        raise ValueError("The GitHub release notes could not be read.")
-    return RelfUpdate(version, notes, size, sha256(checksum))
+    return version, checked_update(version, release.get("body") or "", asset["size"], checksum)
 
 
 def download_update(update, staged, *, on_progress=None):

@@ -186,6 +186,8 @@
   "Update and restart": "اپ ڈیٹ کر کے دوبارہ چلائیں",
   "Self-updates are available in the Windows Relf executable.": "Relf کی Windows EXE فائل خود کو اپ ڈیٹ کر سکتی ہے۔",
   "Checking for Relf updates…": "Relf کی اپ ڈیٹس چیک ہو رہی ہیں…",
+  "Last checked release: v{version}": "آخری بار جانچ میں ملا ورژن: v{version}",
+  "GitHub is limiting update checks. Try again later.": "GitHub اپ ڈیٹس کی جانچ محدود کر رہا ہے۔ بعد میں دوبارہ کوشش کریں۔",
   "Could not check for Relf updates: {error}": "Relf کی اپ ڈیٹس چیک نہیں ہو سکیں: {error}",
   "Relf is up to date.": "Relf کا تازہ ترین ورژن چل رہا ہے۔",
   "Close the item editor and let any installs finish before updating Relf.": "Relf کو اپ ڈیٹ کرنے سے پہلے آئٹم ایڈیٹر بند کریں اور جاری انسٹالیشن مکمل ہونے دیں۔",

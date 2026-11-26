@@ -28,7 +28,8 @@ from shelf_window import RESULT_STATUSES, SUMMARY_STATUSES, WORKING, ShelfWindow
 from shelf_i18n import LANGUAGES, catalog, tr
 from shelf_options import read_language
 from shelf_theme import DARK, LIGHT, PALETTES, category_picker, read_appearance
-from shelf_update import RelfUpdate
+from shelf_update import LATEST_RELEASE, RelfUpdate, RelfUpdateRateLimited, read_cached_release
+from shelf_version import __version__
 
 
 def descendants(widget):
@@ -565,9 +566,13 @@ class DesktopTest(unittest.TestCase):
         targets.write_text('{"alpha": "relative.exe"}', encoding="utf-8")
         with patch.dict(os.environ, LOCALAPPDATA=str(self.appearance.parent)):
             setting = destination_preference_path()
+            self.root.deiconify()
             self.ui.options_button.invoke()
             options = self.ui.options
+            self.root.update()
+            initial_height = options.winfo_height()
             self.assertEqual(options.download_folder.get(), str(self.dest))
+            self.assertFalse(options.download_hint.winfo_ismapped())
             with patch("shelf_options.filedialog.askdirectory", return_value="") as picker:
                 options.browse_button.invoke()
                 self.assertEqual(picker.call_args.kwargs["initialdir"], str(self.dest))
@@ -582,13 +587,25 @@ class DesktopTest(unittest.TestCase):
                 targets.unlink()
                 options.browse_button.invoke()
 
+            self.root.update()
             self.assertEqual(default_destination(), next_folder)
             self.assertEqual(self.ui.dest, self.dest)
+            self.assertTrue(options.download_hint.winfo_ismapped())
+            self.assertGreater(options.winfo_height(), initial_height)
             self.assertEqual(options.download_hint.cget("text"), "Restart Relf to use the selected folder.")
             options.close_button.invoke()
             self.ui.options_button.invoke()
-            self.assertEqual(self.ui.options.download_folder.get(), str(next_folder))
-            self.assertEqual(self.ui.options.download_hint.cget("text"), "Restart Relf to use the selected folder.")
+            options = self.ui.options
+            self.root.update()
+            self.assertEqual(options.download_folder.get(), str(next_folder))
+            self.assertTrue(options.download_hint.winfo_ismapped())
+            with patch("shelf_options.filedialog.askdirectory", return_value=str(self.dest)):
+                self.dest.mkdir(exist_ok=True)
+                options.browse_button.invoke()
+            self.root.update()
+            self.assertEqual(default_destination(), self.dest)
+            self.assertFalse(options.download_hint.winfo_ismapped())
+            self.assertEqual(options.winfo_height(), initial_height)
 
     def assert_dropdown_join(self, trigger, menu, *, below):
         self.assertTrue(trigger.instate(["selected"]))
@@ -1277,7 +1294,7 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(trigger.instate(["!selected"]))
         self.assertIs(self.root.focus_get(), trigger)
 
-    def test_dropdowns_indicate_focus_with_a_single_outer_border(self):
+    def test_dropdowns_indicate_focus_with_fills(self):
         self.ui.options_button.invoke()
         palette = self.ui.palette
         for menu in (self.ui.more_menu, self.ui.options.language_menu):
@@ -1286,16 +1303,17 @@ class DesktopTest(unittest.TestCase):
             self.assertEqual(self.ui.style.lookup(menu.arrow.cget("style"), "font"),
                              self.ui.style.lookup("Treeview.Heading", "font"))
             style = button.cget("style")
-            for state, border in (((), palette.line), (("focus",), palette.accent),
-                                  (("active",), palette.accent), (("active", "pressed", "focus"), palette.accent),
-                                  (("disabled", "focus"), palette.line)):
+            for state, fill in (((), palette.surface), (("focus",), palette.selection),
+                                (("active",), palette.subtle), (("active", "pressed", "focus"), palette.selection),
+                                (("disabled", "focus"), palette.subtle)):
                 with self.subTest(style=style, state=state):
                     lookup = self.ui.style.lookup
-                    self.assertEqual(lookup(style, "bordercolor", state), border)
+                    self.assertEqual(lookup(style, "bordercolor", state), palette.line)
                     self.assertEqual(int(lookup(style, "borderwidth", state)), 1)
-                    fill = lookup(style, "background", state)
-                    for option in ("lightcolor", "darkcolor", "focuscolor"):
+                    self.assertEqual(int(lookup(style, "focusthickness", state)), 0)
+                    for option in ("background", "lightcolor", "darkcolor"):
                         self.assertEqual(lookup(style, option, state), fill)
+                    self.assertEqual(lookup(menu.arrow.cget("style"), "background", state), fill)
 
     def click_header(self, column):
         tree = self.ui.tree
@@ -2437,6 +2455,14 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         self.assertTrue(count.instate(["selected", "!pressed"]))
         self.assertEqual(background(count), background(button))
+        button.focus_force()
+        self.wait_for(lambda: count.instate(["focus"]))
+        self.assertEqual(background(count), background(button))
+        self.assertNotEqual(background(button), self.ui.palette.selection)
+        self.assertNotIn("focus", button.identify(0, 0).lower())
+        self.ui.tree.focus_set()
+        self.wait_for(lambda: count.instate(["!focus"]))
+        self.assertEqual(background(button), self.ui.palette.selection)
 
     def test_sidebar_drag_resizes_app_list_and_survives_collapse(self):
         self.root.deiconify()
@@ -3351,25 +3377,57 @@ class DesktopTest(unittest.TestCase):
         self.assertIn("0 of 2 processed, 2 canceled", self.ui.status.get())
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
 
-    def test_relf_update_downloads_before_the_notice_and_installs_without_network(self):
+    def test_footer_refresh_checks_github_again_and_shows_the_latest_version(self):
+        refresh = self.ui.relf_refresh_button
+        notice = self.ui.relf_update_button
+        self.root.deiconify()
+        self.root.update()
+        installed = next(label for label in refresh.master.winfo_children()
+                         if isinstance(label, ttk.Label) and label.cget("text") == f"v{__version__}")
+        self.assertTrue(refresh.winfo_ismapped())
+        self.assertEqual(refresh.cget("text"), "↻")
+        self.assertEqual(self.ui.style.lookup(refresh.cget("style"), "font"),
+                         self.ui.style.lookup(installed.cget("style"), "font"))
+        self.assertFalse(notice.winfo_ismapped())
+        self.assertEqual(installed.winfo_x() - refresh.winfo_x() - refresh.winfo_width(), 2)
+
+        with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
+              patch("shelf_update.read_page") as page):
+            for version in ("0.45.0", "0.45.1"):
+                page.return_value = json.dumps({"tag_name": f"v{version}"})
+                point = {"x": refresh.winfo_width() // 2, "y": refresh.winfo_height() // 2}
+                refresh.event_generate("<Enter>", **point)
+                refresh.event_generate("<ButtonPress-1>", **point)
+                refresh.event_generate("<ButtonRelease-1>", **point)
+                self.assertTrue(refresh.instate(["disabled"]))
+                self.wait_for(lambda: self.ui.relf_dialog is not None)
+                dialog = self.ui.relf_dialog
+                self.assertTrue(refresh.instate(["disabled"]))
+                self.assertEqual(dialog.heading.cget("text"), "Relf is up to date.")
+                self.assertEqual(dialog.detail.cget("text"), f"Last checked release: v{version}")
+                dialog.destroy()
+                self.assertTrue(refresh.instate(["!disabled"]))
+                page.assert_called_once_with(LATEST_RELEASE, headers={"Cache-Control": "no-cache"})
+                page.reset_mock()
+
+    def test_relf_update_downloads_before_the_notice_and_installs_when_rate_limited(self):
         release = RelfUpdate("1.0.0", "- A new release", 8, hashlib.sha256(b"download").hexdigest())
         executable = self.dest.parent / "Relf.exe"
-        menu_action = self.ui.more_menu.buttons["Check for Relf updates"]
         notice = self.ui.relf_update_button
         progress = self.ui.download_progress
         response = GatedDownload()
         verification = GatedPage()
         helper = object()
+        rate_limit = RelfUpdateRateLimited()
 
         def verify_version(_):
             verification()
             return release.version
 
         with (patch("shelf_window.relf_executable", return_value=executable),
-              patch("shelf_window.check_for_update", side_effect=[release, OSError("Offline")]) as check,
+              patch("shelf_window.check_for_update", side_effect=[(release.version, release), rate_limit]) as check,
               patch("shelf_update.open_url", return_value=response) as download,
               patch("shelf_update.windows_product_version", side_effect=verify_version),
-              patch("shelf_window.confirm_relf_update") as confirm,
               patch("shelf_update.start_update_helper", return_value=helper) as restart,
               patch.object(self.ui, "close") as close):
             self.root.deiconify()
@@ -3401,14 +3459,34 @@ class DesktopTest(unittest.TestCase):
                     self.assertEqual(self.ui.style.lookup(label.cget("style"), "font"), notice_font)
                     self.assertEqual(label.winfo_y() + label.winfo_height() // 2, notice_center)
 
-            menu_action.invoke()
-            self.wait_for(lambda: self.ui.status.get() == "Could not check for Relf updates: Offline")
-            self.assertTrue(notice.winfo_ismapped())
+            self.assertEqual(read_cached_release(self.ui.relf_release_file), (release.version, release))
             notice.invoke()
+            dialog = self.ui.relf_dialog
+            self.assertIsNotNone(dialog)
+            self.assertEqual(dialog.heading.cget("text"), "Relf v1.0.0 is available")
+            self.assertTrue(dialog.install.instate(["!disabled"]))
+            check.assert_called_once_with()
+            download.assert_called_once()
+            dialog.destroy()
+
+            self.ui.check_relf_updates(manual=False)
+            self.assertFalse(notice.winfo_manager())
+            self.wait_for(notice.winfo_ismapped)
+            notice.invoke()
+            dialog = self.ui.relf_dialog
+            self.assertIsNotNone(dialog)
+            self.assertEqual(dialog.heading.cget("text"), "Last checked release: v1.0.0")
+            self.assertIn(str(rate_limit), dialog.detail.cget("text"))
+            self.assertTrue(dialog.detail.winfo_ismapped())
+            self.assertTrue(dialog.notes.winfo_ismapped())
+            self.assertEqual(dialog.notes.get("1.0", "end-1c"), release.notes)
+            self.assertTrue(dialog.install.instate(["!disabled"]))
+            restart.assert_not_called()
+            dialog.install.invoke()
             self.wait_for(lambda: close.called)
+            self.assertIsNone(self.ui.relf_dialog)
             self.assertEqual(check.call_count, 2)
             download.assert_called_once()
-            confirm.assert_not_called()
             restart.assert_called_once()
             self.assertEqual(restart.call_args.args[0], executable)
             self.assertEqual((restart.call_args.args[1] / "Relf.exe").read_bytes(), b"download")
@@ -3422,29 +3500,150 @@ class DesktopTest(unittest.TestCase):
         notice = self.ui.relf_update_button
         menu_action = self.ui.more_menu.buttons["Check for Relf updates"]
         with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
-              patch("shelf_window.check_for_update", return_value=release),
-              patch("shelf_window.confirm_relf_update", return_value=False) as review,
+              patch("shelf_window.check_for_update", return_value=(release.version, release)),
               patch("shelf_window.stage_update", side_effect=[OSError("Interrupted download"), stage]) as download):
             self.ui.check_relf_updates(manual=False)
             self.wait_for(lambda: self.ui.status.get() == "Could not update Relf: Interrupted download")
             self.assertFalse(self.ui.download_progress.winfo_manager())
             self.assertFalse(notice.winfo_manager())
-            review.assert_not_called()
+            self.assertIsNone(self.ui.relf_dialog)
             menu_action.invoke()
-            self.wait_for(lambda: review.called)
-            review.assert_called_once_with(self.root, self.ui.palette, release)
+            self.wait_for(lambda: not self.ui.relf_checking)
+            self.assertEqual(self.ui.relf_dialog.heading.cget("text"), "Relf v1.0.0 is available")
+            self.assertTrue(self.ui.relf_dialog.install.instate(["!disabled"]))
             self.assertEqual(notice.winfo_manager(), "grid")
             self.assertTrue(notice.instate(["!disabled"]))
+            self.ui.relf_dialog.destroy()
             menu_action.invoke()
-            self.wait_for(lambda: review.call_count == 2)
+            self.wait_for(lambda: not self.ui.relf_checking)
+            self.assertTrue(self.ui.relf_dialog.install.instate(["!disabled"]))
             self.assertEqual(download.call_count, 2)
+
+    def test_relf_update_window_waits_for_a_newer_release_to_be_ready(self):
+        previous = RelfUpdate("1.0.0", "Old notes", 8, "a" * 64)
+        latest = RelfUpdate("1.1.0", "New notes", 8, "b" * 64)
+        stages = [self.dest.parent / f".relf-update-test-{release.version}" for release in (previous, latest)]
+        for stage in stages:
+            stage.mkdir()
+            (stage / "Relf.exe").write_bytes(b"download")
+        request = GatedPage()
+        download = GatedPage()
+
+        def check_latest():
+            request()
+            return latest.version, latest
+
+        def stage_latest(*args, **kwargs):
+            download()
+            return stages[1]
+
+        with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
+              patch("shelf_window.check_for_update", return_value=(previous.version, previous)) as check,
+              patch("shelf_window.stage_update", return_value=stages[0]) as stage):
+            self.root.deiconify()
+            self.ui.check_relf_updates(manual=False)
+            notice = self.ui.relf_update_button
+            self.wait_for(notice.winfo_ismapped)
+            check.side_effect = check_latest
+            stage.side_effect = stage_latest
+            self.ui.more_menu.buttons["Check for Relf updates"].invoke()
+            try:
+                self.wait_for(request.entered.is_set)
+                self.assertIsNone(self.ui.relf_dialog)
+                self.assertFalse(notice.winfo_ismapped())
+                request.resume.set()
+                self.wait_for(download.entered.is_set)
+                self.assertIsNone(self.ui.relf_dialog)
+                self.assertFalse(notice.winfo_ismapped())
+            finally:
+                request.resume.set()
+                download.resume.set()
+
+            self.wait_for(lambda: self.ui.relf_dialog is not None)
+            dialog = self.ui.relf_dialog
+            self.assertEqual(dialog.heading.cget("text"), "Relf v1.1.0 is available")
+            self.assertEqual(dialog.notes.get("1.0", "end-1c"), latest.notes)
+            self.assertTrue(dialog.install.instate(["!disabled"]))
+            self.assertEqual(self.ui.relf_pending, (latest, stages[1]))
+            self.assertFalse(stages[0].exists())
+            self.assertEqual(check.call_count, 2)
+
+    def test_relf_update_window_shows_the_saved_release_after_reopening(self):
+        rate_limit = RelfUpdateRateLimited()
+        with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
+              patch("shelf_window.check_for_update", side_effect=[("0.45.0", None), rate_limit])):
+            self.ui.check_relf_updates(manual=False)
+            self.wait_for(lambda: not self.ui.relf_checking)
+            second = tk.Toplevel(self.root)
+            self.addCleanup(second.destroy)
+            reopened = ShelfWindow(second, self.ui.catalog, self.dest, self.ui.targets,
+                                   appearance_file=self.appearance)
+            reopened.more_menu.buttons["Check for Relf updates"].invoke()
+            self.wait_for(lambda: not reopened.relf_checking)
+            dialog = reopened.relf_dialog
+            self.assertEqual(dialog.heading.cget("text"), "Last checked release: v0.45.0")
+            self.assertIn(str(rate_limit), dialog.detail.cget("text"))
+            self.assertEqual([child.cget("text") for child in descendants(dialog) if isinstance(child, ttk.Button)],
+                             ["Close"])
+
+    def test_relf_update_window_offers_only_close_when_rate_limited_on_first_check(self):
+        rate_limit = RelfUpdateRateLimited()
+        with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
+              patch("shelf_window.check_for_update", side_effect=rate_limit),
+              patch("shelf_window.stage_update") as stage):
+            self.ui.more_menu.buttons["Check for Relf updates"].invoke()
+            self.wait_for(lambda: self.ui.relf_dialog is not None)
+            dialog = self.ui.relf_dialog
+            self.assertIn(str(rate_limit), dialog.heading.cget("text"))
+            self.assertEqual([child.cget("text") for child in descendants(dialog) if isinstance(child, ttk.Button)],
+                             ["Close"])
+            stage.assert_not_called()
+
+    def test_relf_automatically_downloads_the_saved_release_on_a_rate_limited_startup(self):
+        payload = b"download"
+        release = RelfUpdate("1.0.0", "Saved release notes", len(payload), hashlib.sha256(payload).hexdigest())
+        executable = self.dest.parent / "Relf.exe"
+        response = GatedDownload()
+        rate_limit = RelfUpdateRateLimited()
+        with patch("shelf_window.relf_executable", return_value=executable):
+            with (patch("shelf_window.check_for_update", return_value=(release.version, release)),
+                  patch("shelf_window.stage_update", side_effect=OSError("Interrupted download"))):
+                self.ui.check_relf_updates(manual=False)
+                self.wait_for(lambda: not self.ui.relf_checking)
+                self.assertIsNone(self.ui.relf_pending)
+            second = tk.Toplevel(self.root)
+            self.addCleanup(second.destroy)
+            reopened = ShelfWindow(second, self.ui.catalog, self.dest, self.ui.targets,
+                                   appearance_file=self.appearance)
+            with (patch("shelf_window.check_for_update", side_effect=rate_limit),
+                  patch("shelf_update.open_url", return_value=response) as download,
+                  patch("shelf_update.windows_product_version", return_value=release.version)):
+                reopened.check_relf_updates(manual=False)
+                try:
+                    self.wait_for(response.waiting.is_set)
+                    self.assertFalse(reopened.relf_update_button.winfo_manager())
+                    self.assertIsNone(reopened.relf_dialog)
+                    reopened.more_menu.buttons["Check for Relf updates"].invoke()
+                    self.assertIsNone(reopened.relf_dialog)
+                finally:
+                    response.resume.set()
+                self.wait_for(lambda: reopened.relf_dialog is not None)
+                dialog = reopened.relf_dialog
+                self.assertEqual(reopened.relf_update_button.winfo_manager(), "grid")
+                self.assertEqual(dialog.heading.cget("text"), "Last checked release: v1.0.0")
+                self.assertIn(str(rate_limit), dialog.detail.cget("text"))
+                self.assertTrue(dialog.install.instate(["!disabled"]))
+                metadata, stage = reopened.relf_pending
+                self.assertEqual(metadata, release)
+                self.assertEqual((stage / "Relf.exe").read_bytes(), payload)
+                download.assert_called_once_with("https://github.com/notuxius/refl/releases/download/v1.0.0/Relf.exe")
 
     def test_closing_relf_cancels_and_discards_a_partial_self_update(self):
         release = RelfUpdate("1.0.0", "", 8, hashlib.sha256(b"download").hexdigest())
         executable = self.dest.parent / "Relf.exe"
         response = GatedDownload()
         with (patch("shelf_window.relf_executable", return_value=executable),
-              patch("shelf_window.check_for_update", return_value=release),
+              patch("shelf_window.check_for_update", return_value=(release.version, release)),
               patch("shelf_update.open_url", return_value=response)):
             self.ui.check_relf_updates(manual=False)
             try:
@@ -3461,7 +3660,7 @@ class DesktopTest(unittest.TestCase):
     def test_relf_checks_again_after_one_day_and_defers_while_busy(self):
         executable = self.dest.parent / "Relf.exe"
         with (patch("shelf_window.relf_executable", return_value=executable),
-              patch("shelf_window.check_for_update", return_value=None) as check,
+              patch("shelf_window.check_for_update", return_value=("0.45.0", None)) as check,
               patch.object(self.root, "after", wraps=self.root.after) as schedule):
             self.ui.check_relf_updates_periodically()
             self.wait_for(lambda: not self.ui.relf_checking)
@@ -3957,6 +4156,11 @@ class DesktopTest(unittest.TestCase):
         self.wait_for(lambda: self.root.focus_get() is entry)
         entry.insert(0, "beta")
         self.root.update()
+        search_parts = (self.ui.search_field, self.ui.search_lens, entry, self.ui.search_clear)
+        for widget in search_parts:
+            self.assertEqual(self.ui.style.lookup(widget["style"], "background", widget.state()),
+                             self.ui.palette.selection)
+        self.assertEqual(self.ui.search_border["style"], "Line.TFrame")
         self.assertEqual(tree.get_children(), (self.keys[1],))
         entry.event_generate("<Escape>")
         self.root.update()

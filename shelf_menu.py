@@ -167,7 +167,7 @@ class DropdownMenu(AppMenu):
 
     def sync_arrow(self):
         states = self.master.state()
-        self.arrow.state([s if s in states else f"!{s}" for s in ("disabled", "selected", "pressed", "active")])
+        self.arrow.state([s if s in states else f"!{s}" for s in ("disabled", "selected", "pressed", "active", "focus")])
         self.arrow.configure(text=ARROW_UP if "selected" in states else ARROW_DOWN)
 
     def open_below(self, event=None):
