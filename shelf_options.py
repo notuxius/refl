@@ -10,6 +10,7 @@ from shelf_icons import make_icon
 from shelf_language_menu import LanguageMenu
 from shelf_message import error_detail
 from shelf_paint import stage_window
+from shelf_text import FittedLabel
 from shelf_theme import PALETTES, THEME_MODES, initial_geometry, style_titlebar, write_preference
 
 
@@ -49,14 +50,15 @@ class OptionsWindow(tk.Toplevel):
             folder = (read_destination(destination_file) or destination).resolve()
         except (OSError, ValueError):
             folder = destination
-        self.download_folder = tk.StringVar(self, value=str(folder))
+        self.download_folder = folder
         self.download_heading = ttk.Label(body, font=heading_font)
         self.download_heading.pack(anchor="w")
         downloads = ttk.Frame(body)
         downloads.pack(fill="x", pady=(6, 12))
         downloads.columnconfigure(0, weight=1)
-        ttk.Entry(downloads, textvariable=self.download_folder, state="readonly",
-                  width=12, style="DownloadFolder.TEntry").grid(row=0, column=0, sticky="nsew")
+        self.download_path = FittedLabel(downloads, anchor="w", takefocus=False)
+        self.download_path.grid(row=0, column=0, sticky="nsew")
+        self.download_path.set_text(str(folder))
         self.browse_button = ttk.Button(downloads, command=self.choose_download_folder)
         self.browse_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
         self.download_hint = ttk.Label(downloads, wraplength=390, style="Muted.TLabel", font=("Segoe UI", 9))
@@ -125,7 +127,7 @@ class OptionsWindow(tk.Toplevel):
 
     def choose_download_folder(self):
         folder = filedialog.askdirectory(parent=self, title=tr("Download folder"),
-                                         initialdir=self.download_folder.get(), mustexist=True)
+                                         initialdir=str(self.download_folder), mustexist=True)
         if not folder:
             return
         try:
@@ -136,11 +138,12 @@ class OptionsWindow(tk.Toplevel):
             messagebox.showerror(tr("Download folder"), tr("Could not save preference: {error}",
                                                            error=error_detail(exc)), parent=self)
             return
-        self.download_folder.set(str(destination))
+        self.download_folder = destination
+        self.download_path.set_text(str(destination))
         self.update_download_hint()
 
     def update_download_hint(self):
-        pending = Path(self.download_folder.get()) != self.destination
+        pending = self.download_folder != self.destination
         if pending:
             self.download_hint.configure(text=tr("Restart Relf to use the selected folder."))
             self.download_hint.grid()

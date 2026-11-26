@@ -41,7 +41,7 @@ from shelf_options import OptionsWindow, read_language
 from shelf_paint import keep_view_visible, show_window, stage_window
 from shelf_progress import DownloadProgress
 from shelf_running_app import app_is_running, close_running_app
-from shelf_scroll import grid_scrollable
+from shelf_scroll import grid_horizontal_scrollbar, grid_scrollable
 from shelf_text import CELL_TEXT_INSETS, TK_CELL_INSETS, FittedLabel, FittedTreeview, FullTextTooltip, fit_text
 from shelf_theme import (ARROW_DOWN, ARROW_UP, NAV_ICON_INSET, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
                         preference_path, read_appearance, style_titlebar, style_widgets, system_mode,
@@ -66,6 +66,7 @@ SUMMARY_STATUSES = ("Updated", "Cached", "Latest", "Verified", "Applied",
 PUBLICATION_RETRY_MS = 2000
 COLUMN_WIDTHS = {"Name": 126, "Category": 100, "Local version": 94,
                  "Available version": 115, "Status": 108, "Source": 110}
+MIN_COLUMN_WIDTH = 80
 SORTABLE_COLUMNS = ("Name", "Category", "Status")
 SEARCH_CHAR_LIMIT = 64
 SIDEBAR_FOOTER_GAP = 3
@@ -642,8 +643,9 @@ class ShelfWindow:
     def toggle_sidebar(self):
         if not self.sidebar_compact:
             self.expanded_sidebar_width = self.sidebar.winfo_width()
-        self.sidebar_compact = not self.sidebar_compact
-        self.apply_sidebar_layout()
+        with keep_view_visible(self.root):
+            self.sidebar_compact = not self.sidebar_compact
+            self.apply_sidebar_layout()
         self.save_sidebar()
 
     def apply_sidebar_layout(self):
@@ -958,8 +960,11 @@ class ShelfWindow:
             self.tree.heading(name, anchor="center")
             if name in SORTABLE_COLUMNS:
                 self.tree.heading(name, command=lambda column=name: self.sort_by(column))
-            self.tree.column(name, minwidth=1, anchor="center")
+            self.tree.column(name, minwidth=MIN_COLUMN_WIDTH, anchor="center")
         grid_scrollable(self.tree, reserve_space=False)
+        self.table_horizontal_scrollbar = grid_horizontal_scrollbar(self.tree)
+        for sequence in ("<Map>", "<Unmap>"):
+            self.table_horizontal_scrollbar.bind(sequence, self.fit_table_rows)
         self.row_bars = []
         for _ in range(MAX_PARALLEL_ITEMS):
             bar = ttk.Progressbar(self.tree, style="Download.Horizontal.TProgressbar", takefocus=False)
@@ -1009,16 +1014,21 @@ class ShelfWindow:
             return
         # Leave the card's one-pixel bottom border below the table.
         available = self.table_area.winfo_rooty() + self.table_area.winfo_height() - tree.winfo_rooty() - 1
+        scrollbar = self.table_horizontal_scrollbar
+        horizontal_scroll = scrollbar.winfo_manager() == "grid"
+        if horizontal_scroll:
+            available -= scrollbar.winfo_reqheight()
         row_height = int(self.style.lookup("Treeview", "rowheight"))
         current = int(tree["height"])
         heading = tree.winfo_reqheight() - current * row_height
         body = available - heading
         count = len(tree.get_children())
+        if count and not horizontal_scroll:
+            # The card can clip a partial row when there's no scrollbar below it.
+            body += row_height - 1
+        rows = max(1, body // row_height)
         if count:
-            # Request the partial row too. The card is clipped to the available pixels.
-            rows = min(count, max(1, (body + row_height - 1) // row_height))
-        else:
-            rows = max(1, body // row_height)
+            rows = min(count, rows)
         if rows != current:
             tree.configure(height=rows)
 
@@ -1099,7 +1109,7 @@ class ShelfWindow:
             width = self.column_widths[name]
             if checklist and name == "Status":
                 width = max(width, self.checklist_status_width)
-            self.tree.column(name, width=saved.get(name, width))
+            self.tree.column(name, width=max(MIN_COLUMN_WIDTH, saved.get(name, width)))
 
     def finish_column_drag(self, event):
         if self.divider_pressed:
@@ -1513,7 +1523,6 @@ class ShelfWindow:
         self.refresh_headings()
         heading_font = tkfont.Font(root=self.root, font=self.style.lookup("Treeview.Heading", "font"))
         row_font = tkfont.Font(root=self.root, font=self.style.lookup("Treeview", "font"))
-        min_column_width = max(row_font.measure("..."), heading_font.measure("...")) + CELL_TEXT_INSETS
         self.checklist_status_width = max(row_font.measure(tr(s)) for s in
                                           ("Applied", "Not applied", "Partially applied", "Error")) + 36
         statuses = [tr(status) for status in (*RESULT_STATUSES, "Canceling…")]
@@ -1521,7 +1530,6 @@ class ShelfWindow:
         statuses.append(tr("Retry {attempt}/{total}", attempt=total, total=total))
         statuses.extend(tr("{action}…", action=tr(action)) for action in (*WORKING.values(), "Downloading"))
         for name, width in COLUMN_WIDTHS.items():
-            self.tree.column(name, minwidth=min_column_width)
             label = tr(name)
             if name in SORTABLE_COLUMNS:
                 label += " " + ARROW_DOWN

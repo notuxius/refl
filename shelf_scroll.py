@@ -12,6 +12,13 @@ class _Scrollbar(ttk.Scrollbar):
             self.grid()
 
 
+def grid_horizontal_scrollbar(widget):
+    bar = _Scrollbar(widget.master, orient="horizontal", command=widget.xview)
+    bar.grid(row=1, column=0, sticky="nsew")
+    widget.configure(xscrollcommand=bar.set)
+    return bar
+
+
 def grid_scrollable(widget, *, horizontal=False, reserve_space=True):
     parent = widget.master
     parent.rowconfigure(0, weight=1)
@@ -21,9 +28,7 @@ def grid_scrollable(widget, *, horizontal=False, reserve_space=True):
     vertical.grid(row=0, column=1, sticky="nsew")
     widget.configure(yscrollcommand=vertical.set)
     if horizontal:
-        bar = _Scrollbar(parent, orient="horizontal", command=widget.xview)
-        bar.grid(row=1, column=0, sticky="nsew")
-        widget.configure(xscrollcommand=bar.set)
+        bar = grid_horizontal_scrollbar(widget)
 
     def reserve_gutters():
         # Keeping the viewport size stable prevents word wrapping from changing

@@ -343,17 +343,6 @@ def style_widgets(s, p):
                 selectbackground=p.selection, selectforeground=p.text, lightcolor=p.line, padding=5)
     s.map("TEntry", bordercolor=[], lightcolor=[],
           fieldbackground=[("disabled", p.subtle), ("focus", p.selection)])
-    folder_entry = "DownloadFolder.TEntry"
-    folder_field = "Relf.folderField"
-    if folder_field not in s.element_names():
-        s.element_create(folder_field, "from", "alt", "Entry.field")
-        s.layout(folder_entry, [(folder_field, {"sticky": "nsew", "border": 1, "children": [
-            ("Entry.padding", {"sticky": "nsew", "children": [
-                ("Entry.textarea", {"sticky": "nsew"})]})]})])
-    s.configure(folder_entry, focuswidth=1, focuscolor=p.accent)
-    s.map(folder_entry, fieldbackground=[("readonly", p.surface)],
-          selectbackground=[("focus", p.accent), ("!focus", p.selection)],
-          selectforeground=[("focus", p.on_accent), ("!focus", p.text)])
     s.configure("TCombobox", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
                 selectbackground=p.selection, selectforeground=p.text, padding=(8, 6),
                 postoffset=(0, 1, 0, -2))  # Overlap the field outline by 1 px in either direction.

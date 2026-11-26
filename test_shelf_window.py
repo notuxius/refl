@@ -571,10 +571,22 @@ class DesktopTest(unittest.TestCase):
             options = self.ui.options
             self.root.update()
             initial_height = options.winfo_height()
-            self.assertEqual(options.download_folder.get(), str(self.dest))
+            path = options.download_path
+            self.assertIsInstance(path, ttk.Label)
+            self.assertEqual(path.full_text, str(self.dest))
             self.assertFalse(options.download_hint.winfo_ismapped())
+            options.language_button.focus_force()
+            self.root.update()
+            options.language_button.event_generate("<Tab>")
+            self.root.update()
+            self.assertIs(options.focus_get(), options.browse_button)
+            path.event_generate("<ButtonPress-1>", x=5, y=5)
+            path.event_generate("<B1-Motion>", x=50, y=5)
+            path.event_generate("<ButtonRelease-1>", x=50, y=5)
+            self.root.update()
+            self.assertIs(options.focus_get(), options.browse_button)
             with patch("shelf_options.filedialog.askdirectory", return_value="") as picker:
-                options.browse_button.invoke()
+                options.browse_button.event_generate("<space>")
                 self.assertEqual(picker.call_args.kwargs["initialdir"], str(self.dest))
             self.assertFalse(setting.exists())
 
@@ -583,13 +595,17 @@ class DesktopTest(unittest.TestCase):
                 options.browse_button.invoke()
                 error.assert_called_once()
                 self.assertFalse(setting.exists())
-                self.assertEqual(options.download_folder.get(), str(self.dest))
+                self.assertEqual(path.full_text, str(self.dest))
                 targets.unlink()
-                options.browse_button.invoke()
+                browse = options.browse_button
+                browse.event_generate("<Enter>", x=5, y=5)
+                browse.event_generate("<ButtonPress-1>", x=5, y=5)
+                browse.event_generate("<ButtonRelease-1>", x=5, y=5)
 
             self.root.update()
             self.assertEqual(default_destination(), next_folder)
             self.assertEqual(self.ui.dest, self.dest)
+            self.assertEqual(path.full_text, str(next_folder))
             self.assertTrue(options.download_hint.winfo_ismapped())
             self.assertGreater(options.winfo_height(), initial_height)
             self.assertEqual(options.download_hint.cget("text"), "Restart Relf to use the selected folder.")
@@ -597,7 +613,7 @@ class DesktopTest(unittest.TestCase):
             self.ui.options_button.invoke()
             options = self.ui.options
             self.root.update()
-            self.assertEqual(options.download_folder.get(), str(next_folder))
+            self.assertEqual(options.download_path.full_text, str(next_folder))
             self.assertTrue(options.download_hint.winfo_ismapped())
             with patch("shelf_options.filedialog.askdirectory", return_value=str(self.dest)):
                 self.dest.mkdir(exist_ok=True)
@@ -1703,6 +1719,9 @@ class DesktopTest(unittest.TestCase):
         self.assertIn("Name", reopened.saved_widths["tracked"])
         self.assertIn("Name", reopened.saved_widths["checklist"])
 
+        drag("Name", -width(), 4000)
+        self.assertEqual(width(), 80)
+
     def test_visible_columns_fill_table_after_hiding_and_resizing(self):
         self.root.geometry("1120x680")
         self.root.deiconify()
@@ -1736,6 +1755,37 @@ class DesktopTest(unittest.TestCase):
         bar = self.assert_scrollbar_visible(tree, True)
         self.assertEqual(right_edge(tree), bar.winfo_rootx())
         self.assertEqual(tree.xview(), (0.0, 1.0))
+
+    def test_app_list_expands_old_narrow_columns_and_scrolls_when_needed(self):
+        widths = dict.fromkeys(self.ui.tree["columns"], 37)
+        self.ui.widths_file.parent.mkdir(exist_ok=True)
+        self.ui.widths_file.write_text(json.dumps({"tracked": widths}), encoding="utf-8")
+        window = tk.Toplevel(self.root)
+        self.addCleanup(window.destroy)
+        ui = ShelfWindow(window, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
+        window.geometry("760x430")
+        self.root.update()
+        ui.panes.sash_place(0, 310, 0)
+        tree = ui.tree
+        for _ in range(40):
+            tree.insert("", "end")
+        bar = self.assert_scrollbar_visible(tree, True, orient="horizontal")
+        for name in tree["displaycolumns"]:
+            self.assertGreaterEqual(tree.column(name, "width"), 80)
+        row = tree.get_children()[0]
+        values = list(tree.rows[row])
+        values[2:4] = "12.34.5", "12.35.0"
+        tree.set_values(row, values)
+        self.assertEqual(tree.set(row, "Local version"), "12.34.5")
+        self.assertEqual(tree.set(row, "Available version"), "12.35.0")
+        self.assertLessEqual(bar.winfo_rooty() + bar.winfo_height(),
+                             ui.table_area.winfo_rooty() + ui.table_area.winfo_height())
+        tree.xview_moveto(1)
+        self.root.update()
+        self.assertGreater(tree.xview()[0], 0)
+        self.assertEqual(tree.xview()[1], 1)
+        window.geometry("1120x680")
+        self.assert_scrollbar_visible(tree, False, orient="horizontal")
 
     def test_clipped_catalog_text_refits_and_full_values_remain_searchable(self):
         ui = self.ui
@@ -1985,6 +2035,28 @@ class DesktopTest(unittest.TestCase):
                 toggle.invoke()
                 self.root.update()
                 self.assertEqual((options.winfo_geometry(), toggle.winfo_geometry()), expanded)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows sidebar presentation")
+    def test_sidebar_toggle_reveals_only_the_finished_layout(self):
+        ui = self.ui
+        self.root.deiconify()
+        self.root.geometry("1120x680")
+        self.root.update()
+        expanded_width = ui.sidebar.winfo_width()
+        revealed = []
+
+        def reveal(_):
+            buttons = (ui.options_button, ui.categories_button, ui.nav_buttons["all"], ui.nav_buttons["checklist"])
+            revealed.append((ui.sidebar.winfo_width(), [str(button["compound"]) for button in buttons]))
+
+        with (patch("shelf_paint._cover_client", return_value=1),
+              patch("shelf_paint._user.DestroyWindow", side_effect=reveal)):
+            ui.sidebar_toggle.invoke()
+            compact_width = ui.sidebar.winfo_reqwidth()
+            ui.sidebar_toggle.invoke()
+
+        self.assertLess(compact_width, expanded_width)
+        self.assertEqual(revealed, [(compact_width, ["image"] * 4), (expanded_width, ["left"] * 4)])
 
     def test_compact_category_arrows_scroll_when_icons_overflow(self):
         ui = self.ui
