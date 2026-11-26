@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from shelf_update import (LATEST_RELEASE, RELEASE_DOWNLOAD, RelfUpdate, check_for_update,
-                          download_update, prepare_update, start_update_helper)
+                          download_update, install_update, stage_update, start_update_helper)
 
 
 class UpdateTest(unittest.TestCase):
@@ -46,12 +46,27 @@ class UpdateTest(unittest.TestCase):
                 self.assertEqual((stage / "verified.exe").read_bytes(), payload)
             with (patch("shelf_update.open_url", return_value=io.BytesIO(b"BAD RELF")),
                   self.assertRaisesRegex(ValueError, "SHA-256")):
-                prepare_update(stage / "Relf.exe", release)
+                stage_update(stage / "Relf.exe", release)
             self.assertEqual(list(stage.iterdir()), [stage / "verified.exe"])
             with (patch("shelf_update.open_url", return_value=io.BytesIO(payload)),
                   patch("shelf_update.windows_product_version", return_value="0.9.0"),
                   self.assertRaisesRegex(ValueError, "version does not match")):
                 download_update(release, stage / "wrong-version.exe")
+
+    def test_install_rejects_a_changed_staged_executable(self):
+        payload = b"new relf"
+        release = RelfUpdate("0.10.0", "", len(payload), hashlib.sha256(payload).hexdigest())
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "Relf.exe"
+            with (patch("shelf_update.open_url", return_value=io.BytesIO(payload)),
+                  patch("shelf_update.windows_product_version", return_value=release.version)):
+                stage = stage_update(executable, release)
+            (stage / "Relf.exe").write_bytes(b"BAD RELF")
+            with (patch("shelf_update.start_update_helper") as restart,
+                  self.assertRaisesRegex(ValueError, "SHA-256")):
+                install_update(executable, release, stage)
+            restart.assert_not_called()
+            self.assertFalse(stage.exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows replacement helper")
     def test_helper_waits_then_restarts_or_restores_the_previous_executable(self):

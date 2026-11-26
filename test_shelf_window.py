@@ -3351,8 +3351,7 @@ class DesktopTest(unittest.TestCase):
         self.assertIn("0 of 2 processed, 2 canceled", self.ui.status.get())
         self.assertEqual(self.ui.view_counts["progress"].get(), "0")
 
-    def test_relf_update_notice_and_confirmed_restart(self):
-        earlier_release = RelfUpdate("0.44.1", "- An earlier release", 120, "b" * 64)
+    def test_relf_update_downloads_before_the_notice_and_installs_without_network(self):
         release = RelfUpdate("1.0.0", "- A new release", 8, hashlib.sha256(b"download").hexdigest())
         executable = self.dest.parent / "Relf.exe"
         menu_action = self.ui.more_menu.buttons["Check for Relf updates"]
@@ -3367,48 +3366,14 @@ class DesktopTest(unittest.TestCase):
             return release.version
 
         with (patch("shelf_window.relf_executable", return_value=executable),
-              patch("shelf_window.check_for_update", side_effect=[earlier_release, release, release]) as check,
+              patch("shelf_window.check_for_update", side_effect=[release, OSError("Offline")]) as check,
               patch("shelf_update.open_url", return_value=response) as download,
               patch("shelf_update.windows_product_version", side_effect=verify_version),
+              patch("shelf_window.confirm_relf_update") as confirm,
               patch("shelf_update.start_update_helper", return_value=helper) as restart,
               patch.object(self.ui, "close") as close):
-            self.assertFalse(notice.winfo_manager())
-            self.ui.check_relf_updates(manual=False)
-            self.wait_for(lambda: notice.winfo_manager() == "grid")
-            self.assertIn("Relf update available", notice.cget("text"))
-            self.assertEqual(set(self.ui.jobs), set(self.keys))
-            check.assert_called_once_with()
-            download.assert_not_called()
-
-            displayed_notes = []
-
-            def dialog_button(label):
-                dialog = next((w for w in self.root.winfo_children()
-                               if isinstance(w, tk.Toplevel) and w.title() == "Relf update available"), None)
-                if dialog is None or not dialog.winfo_viewable():
-                    self.root.after(50, dialog_button, label)
-                    return
-                notes = next(w for w in descendants(dialog) if isinstance(w, tk.Text))
-                displayed_notes.append(notes.get("1.0", "end-1c"))
-                next(w for w in descendants(dialog) if isinstance(w, ttk.Button)
-                     and w.cget("text") == label).invoke()
-
             self.root.deiconify()
-            self.root.update_idletasks()
-            notice_font = self.ui.style.lookup(notice.cget("style"), "font")
-            notice_center = notice.winfo_y() + notice.winfo_height() // 2
-            for label in notice.master.winfo_children():
-                if isinstance(label, ttk.Label):
-                    self.assertEqual(self.ui.style.lookup(label.cget("style"), "font"), notice_font)
-                    self.assertEqual(label.winfo_y() + label.winfo_height() // 2, notice_center)
-            self.root.after(100, dialog_button, "Cancel")
-            notice.invoke()
-            self.wait_for(lambda: displayed_notes)
-            self.assertEqual(displayed_notes, [release.notes])
-            download.assert_not_called()
-
-            self.root.after(100, dialog_button, "Update and restart")
-            menu_action.invoke()
+            self.ui.check_relf_updates_periodically()
             try:
                 self.wait_for(lambda: response.waiting.is_set() and progress.percent["text"] == "50%")
                 self.assertTrue(progress.winfo_ismapped())
@@ -3418,31 +3383,103 @@ class DesktopTest(unittest.TestCase):
                 self.wait_for(lambda: verification.entered.is_set() and self.ui.status.get() == "Verifying…")
                 self.assertEqual(progress.percent["text"], "100%")
                 self.assertTrue(progress.winfo_ismapped())
+                self.assertFalse(notice.winfo_ismapped())
                 restart.assert_not_called()
             finally:
                 response.resume.set()
                 verification.resume.set()
 
+            self.wait_for(notice.winfo_ismapped)
+            self.assertFalse(progress.winfo_ismapped())
+            self.assertEqual(set(self.ui.jobs), set(self.keys))
+            check.assert_called_once_with()
+            download.assert_called_once()
+            notice_font = self.ui.style.lookup(notice.cget("style"), "font")
+            notice_center = notice.winfo_y() + notice.winfo_height() // 2
+            for label in notice.master.winfo_children():
+                if isinstance(label, ttk.Label):
+                    self.assertEqual(self.ui.style.lookup(label.cget("style"), "font"), notice_font)
+                    self.assertEqual(label.winfo_y() + label.winfo_height() // 2, notice_center)
+
+            menu_action.invoke()
+            self.wait_for(lambda: self.ui.status.get() == "Could not check for Relf updates: Offline")
+            self.assertTrue(notice.winfo_ismapped())
+            notice.invoke()
             self.wait_for(lambda: close.called)
-            self.assertEqual(displayed_notes, [release.notes, release.notes])
-            self.assertEqual(check.call_count, 3)
+            self.assertEqual(check.call_count, 2)
+            download.assert_called_once()
+            confirm.assert_not_called()
             restart.assert_called_once()
             self.assertEqual(restart.call_args.args[0], executable)
+            self.assertEqual((restart.call_args.args[1] / "Relf.exe").read_bytes(), b"download")
             self.assertIs(self.ui.relf_update_helper, helper)
-            self.assertFalse(progress.winfo_ismapped())
 
-    def test_relf_update_failure_clears_progress_and_restores_notice(self):
+    def test_relf_update_download_failure_hides_notice_until_manual_retry(self):
         release = RelfUpdate("1.0.0", "", 8, "a" * 64)
+        stage = self.dest.parent / ".relf-update-test"
+        stage.mkdir()
+        (stage / "Relf.exe").write_bytes(b"download")
         notice = self.ui.relf_update_button
+        menu_action = self.ui.more_menu.buttons["Check for Relf updates"]
         with (patch("shelf_window.relf_executable", return_value=self.dest.parent / "Relf.exe"),
               patch("shelf_window.check_for_update", return_value=release),
-              patch("shelf_window.confirm_relf_update", return_value=True),
-              patch("shelf_window.prepare_update", side_effect=OSError("Interrupted download"))):
-            self.ui.more_menu.buttons["Check for Relf updates"].invoke()
+              patch("shelf_window.confirm_relf_update", return_value=False) as review,
+              patch("shelf_window.stage_update", side_effect=[OSError("Interrupted download"), stage]) as download):
+            self.ui.check_relf_updates(manual=False)
             self.wait_for(lambda: self.ui.status.get() == "Could not update Relf: Interrupted download")
             self.assertFalse(self.ui.download_progress.winfo_manager())
+            self.assertFalse(notice.winfo_manager())
+            review.assert_not_called()
+            menu_action.invoke()
+            self.wait_for(lambda: review.called)
+            review.assert_called_once_with(self.root, self.ui.palette, release)
             self.assertEqual(notice.winfo_manager(), "grid")
             self.assertTrue(notice.instate(["!disabled"]))
+            menu_action.invoke()
+            self.wait_for(lambda: review.call_count == 2)
+            self.assertEqual(download.call_count, 2)
+
+    def test_closing_relf_cancels_and_discards_a_partial_self_update(self):
+        release = RelfUpdate("1.0.0", "", 8, hashlib.sha256(b"download").hexdigest())
+        executable = self.dest.parent / "Relf.exe"
+        response = GatedDownload()
+        with (patch("shelf_window.relf_executable", return_value=executable),
+              patch("shelf_window.check_for_update", return_value=release),
+              patch("shelf_update.open_url", return_value=response)):
+            self.ui.check_relf_updates(manual=False)
+            try:
+                self.wait_for(lambda: self.ui.download_progress.percent["text"] == "50%")
+                staging = self.ui.relf_staging
+                close_event = tk.Event()
+                close_event.widget = self.root
+                self.ui.on_destroy(close_event)
+                self.assertEqual(staging.result(timeout=5), (None, None))
+                self.assertFalse(list(executable.parent.glob(".relf-update-*")))
+            finally:
+                response.resume.set()
+
+    def test_relf_checks_again_after_one_day_and_defers_while_busy(self):
+        executable = self.dest.parent / "Relf.exe"
+        with (patch("shelf_window.relf_executable", return_value=executable),
+              patch("shelf_window.check_for_update", return_value=None) as check,
+              patch.object(self.root, "after", wraps=self.root.after) as schedule):
+            self.ui.check_relf_updates_periodically()
+            self.wait_for(lambda: not self.ui.relf_checking)
+            check.assert_called_once_with()
+            scheduled = schedule.call_args_list[1].args
+            self.assertEqual(scheduled, (24 * 60 * 60 * 1000, self.ui.check_relf_updates_periodically))
+
+            self.root.after_cancel(self.ui.relf_check_timer)
+            self.ui.busy = True
+            scheduled[1]()
+            check.assert_called_once_with()
+            self.assertEqual(schedule.call_args.args, (60 * 1000, self.ui.check_relf_updates_periodically))
+
+            self.root.after_cancel(self.ui.relf_check_timer)
+            self.ui.busy = False
+            schedule.call_args.args[1]()
+            self.wait_for(lambda: not self.ui.relf_checking)
+            self.assertEqual(check.call_count, 2)
 
     def test_more_menu_cancels_bulk_verification_and_keeps_its_size(self):
         from shelf_cancel import check_canceled

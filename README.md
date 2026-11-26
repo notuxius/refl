@@ -10,7 +10,7 @@ Batch checks and downloads start with up to three items at a time. Relf adds slo
 
 Download `Relf.exe` from [GitHub Releases](https://github.com/notuxius/refl/releases) when the first Relf release is available. Earlier releases contain `ReleaseShelf.exe`. Place it in a writable folder and double-click it. The executable includes Python. Saving your first item creates a `recipes` folder beside it. Keep that folder when replacing the EXE.
 
-The Windows executable checks for a new Relf release when it opens. If **Relf update available** appears in the bottom status row, click it to read the release notes. You can also choose **More → Check for Relf updates**. **Update and restart** verifies the download, replaces the executable in its current folder, and reopens Relf with your app list and settings. If the updated window fails to open, Relf restores the previous executable.
+The Windows executable checks for a new Relf release when it opens and every 24 hours while it stays open. Relf downloads and verifies an available update in the background. Once **Relf update available** appears in the bottom status row, click it to install the downloaded update and restart Relf. You can also choose **More → Check for Relf updates** to check immediately and review the release notes before installing. Relf keeps your app list and settings and restores the previous executable if the updated window fails to open.
 
 To run from source, use Python 3.13 or newer. Double-click `relf_ui.pyw` or open PowerShell in this folder and run:
 

@@ -16,7 +16,7 @@ from urllib.error import HTTPError
 
 from fetch_sources import (GitHubRateLimited, defer_github_checks, digest, open_url, read_page,
                            sha256, windows_product_version, write_chunks)
-from shelf_cancel import read_chunks
+from shelf_cancel import cancel_scope, publisher_items, read_chunks
 from shelf_version import __version__
 
 
@@ -76,26 +76,54 @@ def check_for_update():
 
 def download_update(update, staged, *, on_progress=None):
     url = f"{RELEASE_DOWNLOAD}/v{update.version}/{EXE_NAME}"
-    with open_url(url) as response, staged.open("xb") as target:
-        write_chunks(read_chunks(response), target, update.size, on_progress)
-    if staged.stat().st_size != update.size or digest(staged) != update.checksum:
-        raise ValueError("The downloaded Relf.exe did not pass SHA-256 verification.")
+
+    def chunks():
+        with open_url(url) as response:
+            yield from read_chunks(response)
+
+    with staged.open("xb") as target:
+        write_chunks(publisher_items(chunks), target, update.size, on_progress)
+    verify_update(update, staged)
     if windows_product_version(staged) != update.version:
         raise ValueError("The downloaded Relf.exe version does not match the GitHub release.")
 
 
-def prepare_update(executable, update, *, on_progress=None):
+def verify_update(update, staged):
+    if staged.stat().st_size != update.size or digest(staged) != update.checksum:
+        raise ValueError("The downloaded Relf.exe did not pass SHA-256 verification.")
+
+
+def stage_update(executable, update, *, on_progress=None, cancel=None):
     stage = Path(tempfile.mkdtemp(prefix=".relf-update-", dir=executable.parent))
     try:
-        download_update(update, stage / EXE_NAME, on_progress=on_progress)
+        with cancel_scope(cancel):
+            download_update(update, stage / EXE_NAME, on_progress=on_progress)
+    except Exception:
+        discard_update(stage)
+        raise
+    return stage
+
+
+def discard_update(stage):
+    with suppress(OSError):
+        (stage / EXE_NAME).unlink(missing_ok=True)
+    with suppress(OSError):
+        stage.rmdir()
+
+
+def install_update(executable, update, stage):
+    try:
+        verify_update(update, stage / EXE_NAME)
+    except (OSError, ValueError):
+        discard_update(stage)
+        raise
+    try:
         # PyInstaller one-file builds run both a launcher and a GUI process.
         return start_update_helper(executable, stage, (os.getpid(), os.getppid()), sys.argv[1:])
     except Exception:
-        for name in (EXE_NAME, "armed", "error"):
+        for name in ("armed", "error"):
             with suppress(OSError):
                 (stage / name).unlink(missing_ok=True)
-        with suppress(OSError):
-            stage.rmdir()
         raise
 
 

@@ -2,6 +2,7 @@
 
 import argparse
 from collections import Counter
+from concurrent.futures import Future
 import ctypes
 import json
 from math import ceil
@@ -25,6 +26,7 @@ from releaseshelf import (ERRORS, GITHUB_PAUSED, MAX_PARALLEL_ITEMS, UPDATE_RETR
                           add_recipes_argument, batch_map, default_destination, destination_preference_path,
                           execute, load_targets, local_result, prepare_fetch, read_jobs, updates_disabled)
 from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, run_icon_loader, store_product_id
+from shelf_cancel import JobCanceled
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_checklist import Checklist, ChecklistHistory, LocalItem, catalog_item, run_checklist_step
 from shelf_checkboxes import checkbox_image, header_image
@@ -42,7 +44,8 @@ from shelf_text import CELL_TEXT_INSETS, TK_CELL_INSETS, FittedLabel, FittedTree
 from shelf_theme import (ARROW_DOWN, ARROW_UP, NAV_ICON_INSET, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
                         preference_path, read_appearance, style_titlebar, style_widgets, system_mode,
                         work_area, write_appearance, write_preference)
-from shelf_update import check_for_update, finish_relaunch, prepare_update, relf_executable
+from shelf_update import (EXE_NAME, check_for_update, discard_update, finish_relaunch,
+                          install_update, relf_executable, stage_update)
 from shelf_version import __version__
 
 
@@ -67,6 +70,8 @@ SIDEBAR_FOOTER_GAP = 3
 INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle"}
 ASSETS = Path(__file__).resolve().parent / "assets"
 CHECK_RELF_UPDATES = "Check for Relf updates"
+RELF_UPDATE_CHECK_MS = 24 * 60 * 60 * 1000
+RELF_UPDATE_BUSY_RETRY_MS = 60 * 1000
 
 
 DELETE_ICONS = {DELETE: "close", FOLDER: "folder_x"}
@@ -298,8 +303,10 @@ class ShelfWindow:
         self.options = None
         self.events = Queue()
         self.publication_timer = None
-        self.relf_update_timer = None
+        self.relf_update_timer = self.relf_check_timer = None
         self.relf_checking = self.relf_check_manual = False
+        self.relf_pending = self.relf_staging = None
+        self.relf_update_cancel = Event()
         root.title("Relf")
         if sys.platform == "win32":
             root.iconbitmap(default=str(ASSETS / "relf.ico"))
@@ -1173,7 +1180,7 @@ class ShelfWindow:
         self.download_progress.grid(row=0, column=3, padx=(12, 0))
         self.download_progress.grid_remove()
         self.relf_update_button = ttk.Button(footer, text=tr("Relf update available"),
-                                            style="Footer.Command.TButton", command=self.check_relf_updates)
+                                            style="Footer.Command.TButton", command=self.install_relf_update)
         self.relf_update_button.grid(row=0, column=4, padx=(12, 0))
         self.relf_update_button.grid_remove()
         ttk.Label(footer, text=f"v{__version__}", style="Small.TLabel").grid(row=0, column=5, padx=(12, 0))
@@ -1188,97 +1195,155 @@ class ShelfWindow:
 
     def run_relf_update_task(self, task, finish, *, on_progress=None):
         events = Queue()
+        result = Future()
 
         def report(received, total):
-            events.put(("progress", received, total))
+            events.put((received, total))
 
         def work():
             try:
                 value = task(report) if on_progress is not None else task()
+            except JobCanceled:
+                result.set_result((None, None))
             except ERRORS as exc:
-                events.put(("done", None, error_detail(exc)))
+                result.set_result((None, error_detail(exc)))
             else:
-                events.put(("done", value, None))
+                result.set_result((value, None))
 
         def poll():
+            done = result.done()
             while True:
                 try:
-                    kind, value, detail = events.get_nowait()
+                    received, total = events.get_nowait()
                 except Empty:
-                    self.relf_update_timer = self.root.after(50, poll)
-                    return
-                if kind == "done":
-                    self.relf_update_timer = None
-                    finish(value, detail)
-                    return
-                on_progress(value, detail)
+                    break
+                on_progress(received, total)
+            if done:
+                self.relf_update_timer = None
+                finish(*result.result())
+            else:
+                self.relf_update_timer = self.root.after(50, poll)
 
-        Thread(target=work, daemon=True).start()
+        # Let the download worker clean up its staging files when Relf closes.
+        Thread(target=work, daemon=on_progress is None).start()
         self.relf_update_timer = self.root.after(50, poll)
+        return result
+
+    def check_relf_updates_periodically(self):
+        if relf_executable() is None:
+            return
+        self.check_relf_updates(manual=False)
+        delay = RELF_UPDATE_BUSY_RETRY_MS if self.busy else RELF_UPDATE_CHECK_MS
+        self.relf_check_timer = self.root.after(delay, self.check_relf_updates_periodically)
 
     def check_relf_updates(self, *, manual=True):
         if self.busy:
             return
-        if relf_executable() is None:
+        executable = relf_executable()
+        if executable is None:
             if manual:
                 self.set_status("Self-updates are available in the Windows Relf executable.")
             return
         if manual:
             self.relf_check_manual = True
-            self.set_status("Checking for Relf updates…")
         if not self.relf_checking:
+            if manual:
+                self.set_status("Checking for Relf updates…")
             self.relf_checking = True
-            self.run_relf_update_task(check_for_update, self.finish_relf_check)
+            self.controls()
+            self.run_relf_update_task(check_for_update,
+                                      lambda update, error: self.finish_relf_check(executable, update, error))
 
-    def finish_relf_check(self, update, error):
+    def finish_relf_checking(self):
         manual = self.relf_check_manual
         self.relf_checking = self.relf_check_manual = False
-        if error is not None:
-            if manual and not self.busy:
-                self.set_status("Could not check for Relf updates: {error}", error=error)
-            return
-        if update is None:
-            self.relf_update_button.grid_remove()
-            if manual and not self.busy:
-                self.set_status("Relf is up to date.")
-        else:
-            self.relf_update_button.grid()
-            if manual and not self.busy:
-                self.set_status("Relf update available")
-                self.offer_relf_update(update)
-
-    def offer_relf_update(self, update):
-        if self.installing or self.editor is not None:
-            self.set_status("Close the item editor and let any installs finish before updating Relf.")
-            return
-        executable = relf_executable()
-        self.busy = True
         self.controls()
-        if not confirm_relf_update(self.root, self.palette, update):
-            self.busy = False
-            self.controls()
-            return
-        self.set_status("Downloading Relf v{version}…", version=update.version)
-        self.relf_update_button.grid_remove()
-        self.download_progress.update_progress(0, update.size)
-        self.run_relf_update_task(lambda report: prepare_update(executable, update, on_progress=report),
-                                  self.finish_relf_install, on_progress=self.show_relf_update_progress)
+        return manual
 
-    def show_relf_update_progress(self, received, total):
+    def clear_relf_update(self):
+        if self.relf_pending is not None:
+            discard_update(self.relf_pending[1])
+            self.relf_pending = None
+        self.relf_update_button.grid_remove()
+
+    def finish_relf_check(self, executable, update, error):
+        if update is None:
+            manual = self.finish_relf_checking()
+            if error is None:
+                self.clear_relf_update()
+            if manual and not self.busy:
+                if error is not None:
+                    self.set_status("Could not check for Relf updates: {error}", error=error)
+                else:
+                    self.set_status("Relf is up to date.")
+            return
+        if self.relf_pending is not None:
+            previous, stage = self.relf_pending
+            if (previous.version == update.version and previous.size == update.size
+                    and previous.checksum == update.checksum and (stage / EXE_NAME).is_file()):
+                self.finish_relf_download(update, stage, None)
+                return
+        self.clear_relf_update()
+        self.relf_staging = self.run_relf_update_task(
+            lambda report: stage_update(executable, update, on_progress=report, cancel=self.relf_update_cancel),
+            lambda stage, error: self.finish_relf_download(update, stage, error),
+            on_progress=lambda received, total: self.show_relf_update_progress(update, received, total),
+        )
+
+    def show_relf_update_progress(self, update, received, total):
+        if self.busy:
+            return
         if received is None:
             self.set_status("{action}…", action=message("Verifying"))
         else:
+            status = message("Downloading Relf v{version}…", version=update.version)
+            if self.status_message != status:
+                self.set_status(status.template, **status.params)
             self.download_progress.update_progress(received, total)
 
+    def finish_relf_download(self, update, stage, error):
+        self.relf_staging = None
+        manual = self.finish_relf_checking()
+        if stage is not None:
+            self.relf_pending = (update, stage)
+            self.relf_update_button.grid()
+        if not self.busy:
+            self.download_progress.update_progress(None, None)
+            if error is not None:
+                self.set_status("Could not update Relf: {error}", error=error)
+            elif manual:
+                self.set_status("Relf update available")
+                self.install_relf_update(review=True)
+            else:
+                self.set_status("")
+
+    def install_relf_update(self, *, review=False):
+        if self.busy or self.relf_checking or self.relf_pending is None:
+            return
+        if self.installing or self.editor is not None:
+            self.set_status("Close the item editor and let any installs finish before updating Relf.")
+            return
+        update, stage = self.relf_pending
+        executable = relf_executable()
+        self.busy = True
+        self.controls()
+        if review and not confirm_relf_update(self.root, self.palette, update):
+            self.busy = False
+            self.controls()
+            return
+        self.set_status("{action}…", action=message("Verifying"))
+        self.run_relf_update_task(lambda: install_update(executable, update, stage), self.finish_relf_install)
+
     def finish_relf_install(self, helper, error):
-        self.download_progress.update_progress(None, None)
         self.busy = False
         if error is None:
+            self.relf_pending = None  # The Windows helper now owns the staged update.
             self.relf_update_helper = helper
             self.close()
         else:
             self.set_status("Could not update Relf: {error}", error=error)
-            self.relf_update_button.grid()
+            if not (self.relf_pending[1] / EXE_NAME).is_file():
+                self.clear_relf_update()
             self.controls()
 
     def on_map(self, event):
@@ -1300,6 +1365,19 @@ class ShelfWindow:
         if self.relf_update_timer is not None:
             self.root.after_cancel(self.relf_update_timer)
             self.relf_update_timer = None
+        if self.relf_check_timer is not None:
+            self.root.after_cancel(self.relf_check_timer)
+            self.relf_check_timer = None
+        self.relf_update_cancel.set()
+        if self.relf_staging is not None:
+            def discard_staged_result(result):
+                stage, _ = result.result()
+                if stage is not None:
+                    discard_update(stage)
+
+            self.relf_staging.add_done_callback(discard_staged_result)
+        if self.relf_pending is not None:
+            discard_update(self.relf_pending[1])
         if self.icon_thread is not None:
             self.icon_stopped.set()
             self.icon_tasks.put(None)
@@ -1800,6 +1878,7 @@ class ShelfWindow:
             self.controls()
 
         self.busy = True
+        self.download_progress.update_progress(None, None)
         self.controls()
         self.set_status("Closing {name}.", name=name)
         Thread(target=close_app).start()
@@ -2255,7 +2334,7 @@ class ShelfWindow:
         idle_state = "disabled" if self.busy else "normal"
         self.more_menu.buttons["Reload"].configure(state=idle_state)
         self.more_menu.buttons[CHECK_RELF_UPDATES].configure(state=idle_state)
-        self.relf_update_button.configure(state=idle_state)
+        self.relf_update_button.configure(state="disabled" if self.relf_checking else idle_state)
         self.more_button.configure(state="normal" if self.bulk_action == "verify" else idle_state)
         self.more_menu.sync_arrow()
         self.add_button.configure(state=idle_state)
@@ -2299,6 +2378,7 @@ class ShelfWindow:
         if self.busy or not keys or (isinstance(self.editor, ChecklistWindow) and self.editor.running):
             return
         self.busy = True
+        self.download_progress.update_progress(None, None)
         self.cancel_events = {recipe_key: Event() for recipe_key in keys}
         self.install_key = key if install else None
         self.requested_action = "install" if install else action
@@ -2484,5 +2564,5 @@ def main():
             window.set_status("Could not update Relf: {error}", error=failure)
     except OSError as exc:
         window.set_status("Could not confirm the Relf update: {error}", error=error_detail(exc))
-    window.check_relf_updates(manual=False)
+    window.check_relf_updates_periodically()
     root.mainloop()
