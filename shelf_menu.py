@@ -3,7 +3,7 @@
 import tkinter as tk
 from tkinter import ttk
 
-from shelf_icons import make_icon
+from shelf_icons import set_button_icon
 from shelf_i18n import tr
 from shelf_theme import ARROW_DOWN, ARROW_UP, bind_button_badge, work_area
 
@@ -49,10 +49,7 @@ class AppMenu(tk.Toplevel):
             self.refresh_icon(button, name, palette)
 
     def refresh_icon(self, button, name, palette):
-        normal = make_icon(self, name, palette.text)
-        disabled = make_icon(self, name, palette.muted)
-        button.configure(image=(normal, "disabled", disabled))
-        self.images[button] = (normal, disabled)
+        self.images[button] = set_button_icon(button, name, palette.text, palette.muted)
 
     def set_action_icon(self, button, name, palette):
         if self.icon_names[button] != name:

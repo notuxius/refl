@@ -29,7 +29,7 @@ from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_checklist import Checklist, ChecklistHistory, LocalItem, catalog_item, run_checklist_step
 from shelf_checkboxes import checkbox_image, header_image
 from shelf_delete import DELETE, FOLDER, delete_item, deletion_plan
-from shelf_icons import category_icon, make_icon
+from shelf_icons import category_icon, make_icon, set_button_icon
 from shelf_i18n import set_language, tr
 from shelf_menu import AppMenu, DropdownMenu
 from shelf_message import error_detail, message
@@ -39,7 +39,7 @@ from shelf_progress import DownloadProgress
 from shelf_running_app import app_is_running, close_running_app
 from shelf_scroll import grid_scrollable
 from shelf_text import CELL_TEXT_INSETS, TK_CELL_INSETS, FittedLabel, FittedTreeview, fit_text
-from shelf_theme import (ARROW_DOWN, ARROW_UP, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
+from shelf_theme import (ARROW_DOWN, ARROW_UP, NAV_ICON_INSET, PALETTES, WINDOW_SIDE_PADDING, bind_button_badge, initial_geometry,
                         preference_path, read_appearance, style_titlebar, style_widgets, system_mode,
                         work_area, write_appearance, write_preference)
 from shelf_update import check_for_update, finish_relaunch, prepare_update, relf_executable
@@ -51,10 +51,6 @@ ALL_ACTIONS = {"fetch": "Update all items", "verify": "Verify all items", **APPL
 BULK_ICONS = {**ACTION_ICONS, "apply_selected": "list_checks", "apply_all": "list_checks"}
 VIEWS = {"checklist": "Checklist", "all": "Tracked", "local": "Local only", "updates": "Available updates",
          "progress": "In progress", "attention": "Needs attention", "disabled": "Disabled"}
-TRACKED_EXAMPLE = {
-    "id": "example-app", "name": "Example app",
-    "direct_download": "https://example.com/downloads/example-app.zip", "extract": ["example-app.exe"],
-}
 WORKING = {"check": "Checking", "fetch": "Updating", "resume": "Updating", "verify": "Verifying", "apply": "Applying"}
 RESULT_STATUSES = ("Unknown", "Pending", "Error", "Latest", "Updated", "Cached",
                    "Repair needed", "Update available", "Source error", "Verified", "Disabled", "Local only",
@@ -67,6 +63,7 @@ COLUMN_WIDTHS = {"Name": 126, "Category": 100, "Local version": 94,
                  "Available version": 115, "Status": 108, "Source": 110}
 SORTABLE_COLUMNS = ("Name", "Category", "Status")
 SEARCH_CHAR_LIMIT = 64
+SIDEBAR_FOOTER_GAP = 3
 INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle"}
 ASSETS = Path(__file__).resolve().parent / "assets"
 CHECK_RELF_UPDATES = "Check for Relf updates"
@@ -379,7 +376,7 @@ class ShelfWindow:
         self.tree.bind("<Configure>", self.fit_table_rows, add="+")
         self.build_footer()
         self.captions = {widget: str(widget.cget("text")) for widget in (
-            self.search_clear, self.reset_search_button, self.example_button,
+            self.search_clear, self.reset_search_button,
             self.add_button, self.edit_button, self.more_button)}
         self.search.trace_add("write", self.search_changed)
         self.view.trace_add("write", self.view_changed)
@@ -509,6 +506,7 @@ class ShelfWindow:
         footer.columnconfigure(0, weight=1)
         self.options_button = ttk.Button(footer, text="Options", command=self.open_options,
                                          style="Nav.TButton", compound="left")
+        footer.bind("<Configure>", lambda _: self.fit_sidebar_button(self.options_button))
         self.icon_widgets[self.options_button] = ("settings", "text", 20)
 
         self.sidebar_toggle = ttk.Button(footer, text="Collapse sidebar", compound="image",
@@ -539,13 +537,15 @@ class ShelfWindow:
 
     def position_sidebar_toggle(self):
         padding = 2 if self.sidebar_compact else (4, 2)
-        self.options_button.grid(row=1, column=0, sticky="ew", pady=padding)
+        self.options_button.grid(row=1, column=0, sticky="ew" if self.sidebar_compact else "w", pady=padding)
         if self.sidebar_compact:
             self.sidebar_grip.place_forget()
+            self.sidebar_toggle.configure(padding="")
             self.sidebar_toggle.grid(row=0, column=0, sticky="ew", padx=0, pady=2)
         else:
             self.sidebar_grip.place(relx=1, anchor="ne", width=5, relheight=1, bordermode="outside")
-            self.sidebar_toggle.grid(row=1, column=1, sticky="e", padx=(4, 0), pady=padding)
+            self.sidebar_toggle.configure(padding=(8, 9))
+            self.sidebar_toggle.grid(row=1, column=1, sticky="e", padx=(SIDEBAR_FOOTER_GAP, 0), pady=padding)
 
     def fit_sidebar_button(self, button):
         label, badge = self.sidebar_labels[button]
@@ -554,15 +554,18 @@ class ShelfWindow:
             button.configure(text=caption, padding="")
             return
         # Leave the icon at the same inset on every row. Only the caption shrinks.
-        right = 8 if badge is None else badge.winfo_reqwidth() + 14
-        padding = (12, 9, right, 9)
+        right = NAV_ICON_INSET if badge is None else badge.winfo_reqwidth() + 14
+        padding = (NAV_ICON_INSET, 9, right, 9)
         if tuple(map(int, button["padding"])) != padding:
             button.configure(padding=padding)
-        if button.winfo_width() > 1 and button in self.images:
+        available = button.winfo_width()
+        if button is self.options_button and self.sidebar_footer.winfo_width() > 1:
+            available = self.sidebar_footer.winfo_width() - self.sidebar_toggle.winfo_reqwidth() - SIDEBAR_FOOTER_GAP
+        if available > 1 and button in self.images:
             font = self.style.lookup("Nav.TButton", "font")
             gap = int(self.style.lookup("Nav.TButton", "space"))
             # The focus element takes one pixel on either side.
-            width = button.winfo_width() - 2 - padding[0] - right - self.images[button].width() - gap
+            width = available - 2 - padding[0] - right - self.images[button][0].width() - gap
             caption = fit_text(button, font, caption, width)
         if caption != button["text"]:
             button.configure(text=caption)
@@ -975,9 +978,6 @@ class ShelfWindow:
                   wraplength=300, justify="center").pack(pady=(4, 0))
         self.reset_search_button = ttk.Button(self.empty_panel, text="Reset search", command=self.clear_search)
 
-        self.example_button = ttk.Button(self.empty_panel, text="Open example",
-                                         command=lambda: self.open_editor(example=TRACKED_EXAMPLE))
-
     def fit_table_rows(self, _event=None):
         tree = self.tree
         if not tree.winfo_ismapped():
@@ -1174,7 +1174,7 @@ class ShelfWindow:
         self.download_progress.grid(row=0, column=3, padx=(12, 0))
         self.download_progress.grid_remove()
         self.relf_update_button = ttk.Button(footer, text=tr("Relf update available"),
-                                            style="Command.TButton", command=self.offer_relf_update)
+                                            style="Footer.Command.TButton", command=self.offer_relf_update)
         self.relf_update_button.grid(row=0, column=4, padx=(12, 0))
         self.relf_update_button.grid_remove()
         ttk.Label(footer, text=f"v{__version__}", style="Small.TLabel").grid(row=0, column=5, padx=(12, 0))
@@ -1543,9 +1543,14 @@ class ShelfWindow:
 
     def refresh_icon(self, widget):
         name, color, size = self.icon_widgets[widget]
-        icon = make_icon(self.root, name, getattr(self.palette, color), size)
-        widget.configure(image=icon)
-        self.images[widget] = icon
+        color = getattr(self.palette, color)
+        if isinstance(widget, ttk.Button):
+            disabled = self.style.lookup(widget.cget("style"), "foreground", ("disabled",))
+            self.images[widget] = set_button_icon(widget, name, color, disabled, size)
+        else:
+            icon = make_icon(self.root, name, color, size)
+            widget.configure(image=icon)
+            self.images[widget] = (icon,)
 
     def bind_context_menu(self, tree):
         for sequence in ("<<ContextMenu>>", "<Shift-F10>", "<App>" if sys.platform == "win32" else "<Menu>"):
@@ -1879,7 +1884,7 @@ class ShelfWindow:
         if selected:
             self.open_editor(Path(selected[0]))
 
-    def open_editor(self, path=None, *, example=None):
+    def open_editor(self, path=None):
         if self.busy:
             return
         if self.editor is not None:
@@ -1901,7 +1906,7 @@ class ShelfWindow:
                                               self.checklist_history, self.checklist_result_changed)
             else:
                 self.editor = RecipeEditor(self.root, self.catalog, path, self.palette, self.recipe_saved,
-                                           on_action=on_action, categories=self.category_choices(), example=example,
+                                           on_action=on_action, categories=self.category_choices(),
                                            get_app_folder=lambda: self.app_folder(self.jobs[str(path)]))
             self.editor.bind("<Destroy>", self.editor_closed, add="+")
             if path is not None:
@@ -2072,17 +2077,13 @@ class ShelfWindow:
             elif view == "disabled":
                 title, detail = "No apps with updates disabled", ""
             elif view == "all":
-                title, detail = "No tracked items yet", "Choose an example or add your own item."
+                title, detail = "No tracked items yet", ""
             elif view == "updates":
                 title, detail = "No updates listed", ""
             elif view == "progress":
                 title, detail = "No operations in progress", "Items being checked, updated, or verified appear here."
             else:
                 title, detail = "No issues reported", "Items with source, file, or publication problems appear here."
-            if view == "all" and not members and not query:
-                self.example_button.pack(pady=(10, 0))
-            else:
-                self.example_button.pack_forget()
             self.empty_title.set(tr(title))
             self.empty_detail.set(tr(detail))
             if query and (members or view == "all"):
@@ -2240,7 +2241,6 @@ class ShelfWindow:
         self.more_button.configure(state="normal" if self.bulk_action == "verify" else idle_state)
         self.more_menu.sync_arrow()
         self.add_button.configure(state=idle_state)
-        self.example_button.configure(state=idle_state)
         self.edit_button.configure(state=selected_state)
         if self.app_menu_key in self.jobs:
             self.update_app_menu(self.app_menu_key)

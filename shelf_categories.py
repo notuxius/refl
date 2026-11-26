@@ -12,7 +12,7 @@ from recipe_editor import recipe_bytes
 from releaseshelf import ERRORS, read_jobs
 from shelf_checklist import LocalItem
 from shelf_i18n import tr
-from shelf_icons import make_icon
+from shelf_icons import make_icon, set_button_icon
 from shelf_message import error_detail
 from shelf_paint import show_window, stage_window
 from shelf_theme import category_picker, initial_geometry, style_titlebar
@@ -83,11 +83,11 @@ class CategoryDialog(tk.Toplevel):
         actions = ttk.Frame(frame)
         actions.pack(anchor="e", pady=(8, 0))
         self.cancel_icon = make_icon(self, "diskette_x", palette.text)
-        self.save_icon = make_icon(self, "save", palette.on_accent)
         ttk.Button(actions, text=tr("Cancel"), image=self.cancel_icon, compound="left",
                    command=self.destroy).pack(side="left", padx=(0, 8))
-        save = ttk.Button(actions, text=tr("Save"), image=self.save_icon, compound="left",
+        save = ttk.Button(actions, text=tr("Save"), compound="left",
                           style="Primary.TButton", command=self.save)
+        self.save_icons = set_button_icon(save, "save", palette.on_accent, palette.muted)
         save.pack(side="left")
         if choices is None:
             def enable_save(*_):

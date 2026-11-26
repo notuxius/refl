@@ -112,10 +112,10 @@ def save_recipe(catalog, data, path, original):
 
 
 class RecipeEditor(tk.Toplevel):
-    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=(), example=None,
+    def __init__(self, parent, catalog, path, palette, on_saved, *, on_action=None, categories=(),
                  get_app_folder=None):
         self.original = path.read_bytes() if path is not None else None
-        self.data = dict(example or {})
+        self.data = {}
         raw = None
         if self.original is not None:
             content = self.original.decode("utf-8-sig")

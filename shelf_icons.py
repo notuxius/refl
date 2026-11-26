@@ -63,3 +63,10 @@ def make_icon(master, name, color, size=16):
     icon = tk.PhotoImage(master=master, width=size, height=size)
     icon.tk.call(str(icon), "copy", str(strip), "-from", x, y, x + size, y + size)
     return icon
+
+
+def set_button_icon(button, name, color, disabled_color, size=16):
+    normal = make_icon(button, name, color, size)
+    disabled = make_icon(button, name, disabled_color, size)
+    button.configure(image=(normal, "disabled", disabled))
+    return normal, disabled

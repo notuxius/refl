@@ -448,7 +448,7 @@ class DesktopTest(unittest.TestCase):
         self.assertFalse(nav["local"].winfo_manager())
         self.assertEqual(self.ui.view.get(), "all")
 
-    def test_tracked_example_opens_and_saves_in_a_local_only_catalog(self):
+    def test_empty_tracked_view_shows_only_its_title(self):
         for key in self.keys:
             Path(key).unlink()
         local = self.ui.catalog / "local.json"
@@ -456,24 +456,11 @@ class DesktopTest(unittest.TestCase):
         self.ui.reload()
         self.root.deiconify()
         self.root.update()
-        button = self.ui.example_button
-        self.assertTrue(button.winfo_viewable())
-        self.assertEqual(button.cget("text"), "Open example")
-        button.invoke()
-        self.assertEqual(self.ui.editor.fields["id"].get(), "example-app")
-        self.assertEqual(self.ui.editor.source.get(), "Direct download")
-        self.assertEqual(self.ui.editor.fields["direct_download"].get(), "https://example.com/downloads/example-app.zip")
-        self.assertEqual(self.ui.editor.text_area.get("1.0", "end-1c"), "example-app.exe")
-        self.ui.editor.cancel_button.invoke()
-        self.assertEqual(list(self.ui.catalog.glob("*.json")), [local])
-        button.invoke()
-        download = "https://publisher.example/my-app.zip"
-        self.ui.editor.fields["direct_download"].set(download)
-        self.ui.editor.save_button.invoke()
-        key, = self.ui.tree.get_children()
-        self.assertEqual(self.ui.tree.set(key, "Name"), "Example app")
-        self.assertEqual(self.ui.jobs[key].download, download)
-        self.assertFalse(button.winfo_viewable())
+        self.assertTrue(self.ui.empty_panel.winfo_viewable())
+        self.assertEqual(self.ui.empty_title.get(), "No tracked items yet")
+        self.assertEqual(self.ui.empty_detail.get(), "")
+        self.assertFalse(any(isinstance(widget, ttk.Button) and widget.winfo_viewable()
+                             for widget in self.ui.empty_panel.winfo_children()))
         self.assertEqual(self.ui.view_counts["local"].get(), "1")
 
     def test_local_item_opens_folder_and_edits_without_enabling_updates(self):
@@ -881,6 +868,24 @@ class DesktopTest(unittest.TestCase):
             run.assert_called_once()
             action, folder, directory = run.call_args.args
             self.assertEqual((action.powershell, folder, directory), ("'two'\n'new'\n'latest'", "tools", path.parent))
+
+    def test_disabled_button_icons_match_the_label_color(self):
+        ui = self.ui
+        for key in self.keys:
+            Path(key).unlink()
+        ui.reload()
+        buttons = (*ui.all_buttons.values(), ui.edit_button, ui.more_menu.buttons["Verify all items"])
+        for mode in ("Dark", "Light"):
+            ui.mode.set(mode)
+            ui.refresh_theme()
+            muted = tuple(channel // 257 for channel in self.root.winfo_rgb(ui.palette.muted))
+            for button in buttons:
+                with self.subTest(mode=mode, button=button["text"]):
+                    self.assertTrue(button.instate(["disabled"]))
+                    _, state, icon = button["image"]
+                    self.assertEqual(str(state), "disabled")
+                    self.assertTrue(any(self.root.tk.call(icon, "get", x, y) == muted
+                                        for y in range(16) for x in range(16)))
 
     def test_checklist_toolbar_uses_checked_rows_and_all_rows_across_search(self):
         ui, tree = self.ui, self.ui.tree
@@ -1909,24 +1914,45 @@ class DesktopTest(unittest.TestCase):
         options = self.ui.options_button
         toggle = self.ui.sidebar_toggle
         all_apps = self.ui.nav_buttons["all"]
+        rail = self.ui.sidebar
+        nav = (*self.ui.nav_buttons.values(), self.ui.categories_button)
+
+        def icon_left(button):
+            center_y = button.winfo_height() // 2
+            label_x = next(x for x in range(button.winfo_width()) if button.identify(x, center_y) == "label")
+            return button.winfo_rootx() - rail.winfo_rootx() + label_x
+
         for mode, geometry in (("Light", "760x430"), ("Dark", "1120x680")):
             with self.subTest(mode=mode, geometry=geometry):
                 self.ui.mode.set(mode)
                 self.ui.refresh_theme()
                 self.root.geometry(geometry)
                 self.root.update()
-                self.assertEqual(options.winfo_rootx(), all_apps.winfo_rootx())
-                self.assertLessEqual(right_edge(options), toggle.winfo_rootx())
-                self.assertEqual(right_edge(toggle), right_edge(all_apps))
+                inset = options.winfo_rootx() - rail.winfo_rootx()
+                self.assertGreater(inset, 0)
+                for button in nav:
+                    if button.winfo_viewable():
+                        self.assertEqual(button.winfo_rootx() - rail.winfo_rootx(), inset)
+                        self.assertEqual(right_edge(rail) - right_edge(button), inset)
+                self.assertEqual(right_edge(rail) - right_edge(toggle), inset)
+                self.assertLess(right_edge(options), toggle.winfo_rootx())
+                self.assertEqual(options.winfo_width(), options.winfo_reqwidth())
+                left, _, right, _ = options["padding"]
+                self.assertEqual(left, right)
                 self.assertEqual(toggle.winfo_rooty(), options.winfo_rooty())
                 self.assertEqual(options.winfo_height(), all_apps.winfo_height())
                 self.assertIn(options.cget("image")[0], self.root.image_names())
                 expanded = (options.winfo_geometry(), toggle.winfo_geometry())
+                icon_positions = {button: icon_left(button) for button in (*nav, options) if button.winfo_viewable()}
 
                 toggle.invoke()
                 self.root.update()
+                for button, expected in icon_positions.items():
+                    self.assertEqual(icon_left(button), expected, button["text"])
                 self.assertEqual(toggle.winfo_rootx(), options.winfo_rootx())
                 self.assertEqual(right_edge(toggle), right_edge(options))
+                self.assertEqual(right_edge(rail) - right_edge(options),
+                                 options.winfo_rootx() - rail.winfo_rootx())
                 gap = options.winfo_rooty() - (toggle.winfo_rooty() + toggle.winfo_height())
                 checklist = self.ui.nav_buttons["checklist"]
                 nav_gap = all_apps.winfo_rooty() - (checklist.winfo_rooty() + checklist.winfo_height())
@@ -2201,6 +2227,10 @@ class DesktopTest(unittest.TestCase):
         ui.category_menu.buttons[RENAME].invoke()
         dialog = self.root.grab_current()
         self.assertEqual(dialog.value.get(), "Tools")
+        save = next(w for w in descendants(dialog) if isinstance(w, ttk.Button) and w["text"] == "Save")
+        dialog.value.set("")
+        self.assertTrue(save.instate(["disabled"]))
+        self.assertEqual(str(save["image"][1]), "disabled")
         ui.search.set("alpha")
         dialog.value.set("Utilities")
         dialog.save()
@@ -3321,6 +3351,13 @@ class DesktopTest(unittest.TestCase):
                      and w.cget("text") == label).invoke()
 
             self.root.deiconify()
+            self.root.update_idletasks()
+            notice_font = self.ui.style.lookup(notice.cget("style"), "font")
+            notice_center = notice.winfo_y() + notice.winfo_height() // 2
+            for label in notice.master.winfo_children():
+                if isinstance(label, ttk.Label):
+                    self.assertEqual(self.ui.style.lookup(label.cget("style"), "font"), notice_font)
+                    self.assertEqual(label.winfo_y() + label.winfo_height() // 2, notice_center)
             self.root.after(100, dialog_button, "Cancel")
             notice.invoke()
             update.assert_not_called()

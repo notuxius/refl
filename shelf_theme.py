@@ -13,6 +13,7 @@ from shelf_text import TREE_TEXT_PAD
 
 THEME_MODES = ("System", "Light", "Dark")
 WINDOW_SIDE_PADDING = 22
+NAV_ICON_INSET = 12
 ARROW_UP = "▲"
 ARROW_DOWN = "▼"
 HEADING_FONT = ("Segoe UI Semibold", 9)
@@ -399,6 +400,7 @@ def style_widgets(s, p):
     s.configure("Command.TButton", width=-1, background=p.surface, space=6, padding=(8, 7))
     s.map("Command.TButton", background=[("disabled", p.surface), ("pressed", p.selection), ("active", p.subtle)],
           foreground=[("disabled", p.muted)])
+    s.configure("Footer.Command.TButton", font=s.lookup("Small.TLabel", "font"))
     s.layout("AppMenu.TButton", [("Button.padding", {"sticky": "nswe", "children": [
         ("Button.label", {"sticky": "nswe"})
     ]})])
@@ -414,8 +416,9 @@ def style_widgets(s, p):
     s.configure("Options.TCheckbutton", padding=(0, 3))
     s.layout("Nav.TButton", flat_button)
     # Reserve space for the overlaid count while allowing translated labels to grow.
-    s.configure("Nav.TButton", background=p.subtle, anchor="w", width=-1, space=9, padding=(12, 9, 38, 9))
-    s.configure("Compact.Nav.TButton", anchor="center", width=-1, padding=(9, 9))
+    s.configure("Nav.TButton", background=p.subtle, anchor="w", width=-1, space=9,
+                padding=(NAV_ICON_INSET, 9, 38, 9))
+    s.configure("Compact.Nav.TButton", anchor="center", width=-1, padding=(NAV_ICON_INSET, 9))
     nav_background = [("disabled", p.subtle), ("selected", p.selection), ("pressed", p.selection), ("active", p.surface)]
     nav_foreground = [("disabled", p.line), ("selected", p.text)]
     s.map("Nav.TButton", background=nav_background, foreground=nav_foreground)
