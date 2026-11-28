@@ -11,6 +11,7 @@ from shelf_icons import make_icon
 from shelf_language_menu import LanguageMenu
 from shelf_message import error_detail
 from shelf_paint import stage_window
+from shelf_scroll import grid_scrollable
 from shelf_text import FittedLabel
 from shelf_theme import PALETTES, THEME_MODES, initial_geometry, style_titlebar, write_preference
 
@@ -36,8 +37,15 @@ class OptionsWindow(tk.Toplevel):
         self.mode_images = {}
         self.palette_buttons = {}
         self.swatches = {}
-        body = ttk.Frame(self, padding=(20, 16))
-        body.pack(fill="both", expand=True)
+        panel = ttk.Frame(self)
+        self.viewport = tk.Canvas(panel, highlightthickness=0, borderwidth=0, takefocus=False)
+        grid_scrollable(self.viewport)
+        self.body = body = ttk.Frame(self.viewport, padding=(20, 16, 20, 0))
+        scroll_window = self.viewport.create_window(0, 0, window=body, anchor="nw")
+        self.viewport.bind("<Configure>", lambda event: self.viewport.itemconfigure(scroll_window, width=event.width))
+        body.bind("<Configure>", lambda _: self.viewport.configure(scrollregion=self.viewport.bbox(scroll_window)))
+        self.bind("<MouseWheel>", lambda event: self.viewport.yview_scroll(-event.delta // 120, "units"))
+        self.bind("<FocusIn>", self.show_focused_control)
         heading_font = ("Segoe UI Semibold", 11)
 
         self.language_heading = ttk.Label(body, font=heading_font)
@@ -129,16 +137,36 @@ class OptionsWindow(tk.Toplevel):
             button.grid(row=row, column=column, sticky="ew", padx=(0, 6) if column == 0 else 0, pady=3)
             self.palette_buttons[name] = button
 
-        self.close_button = ttk.Button(body, compound="left", command=self.destroy)
-        self.close_button.pack(anchor="e", pady=(14, 0))
+        footer = ttk.Frame(self, padding=(20, 14, 20, 16))
+        self.close_button = ttk.Button(footer, compound="left", command=self.destroy)
+        self.close_button.pack(anchor="e")
+        footer.pack(side="bottom", fill="x")
+        panel.pack(fill="both", expand=True)
         self.bind("<Escape>", lambda _: self.destroy())
         self.bind("<Map>", lambda event: style_titlebar(self, self.palette.is_dark)
                   if event.widget is self else None)
         self.apply_language(language)
         self.apply_theme(palette)
-        initial_geometry(self, 460, self.winfo_reqheight(), parent=parent)
+        self.fit_controls()
         self.grab_set()
         self.mode_buttons[mode.get()].focus_set()
+
+    def fit_controls(self):
+        self.update_idletasks()
+        self.viewport.configure(width=self.body.winfo_reqwidth(), height=self.body.winfo_reqheight())
+        initial_geometry(self, max(460, self.winfo_width()), 0, parent=self.master)
+
+    def show_focused_control(self, event):
+        if not str(event.widget).startswith(str(self.body) + "."):
+            return
+        top = self.viewport.canvasy(0)
+        height = self.viewport.winfo_height()
+        y = event.widget.winfo_rooty() - self.body.winfo_rooty()
+        bottom = y + event.widget.winfo_height()
+        if y < top:
+            self.viewport.yview_moveto(y / self.body.winfo_height())
+        elif bottom > top + height:
+            self.viewport.yview_moveto((bottom - height) / self.body.winfo_height())
 
     def apply_language(self, code):
         self.title(tr("Options"))
@@ -159,9 +187,7 @@ class OptionsWindow(tk.Toplevel):
         for name, button in (*self.mode_buttons.items(), *self.palette_buttons.items()):
             button.configure(text=tr(name))
         if self.winfo_ismapped():
-            self.update_idletasks()
-            if self.winfo_reqwidth() > self.winfo_width() or self.winfo_reqheight() > self.winfo_height():
-                initial_geometry(self, self.winfo_width(), self.winfo_height(), parent=self.master)
+            self.fit_controls()
 
     def choose_download_folder(self):
         folder = filedialog.askdirectory(parent=self, title=tr("Download folder"),
@@ -229,13 +255,12 @@ class OptionsWindow(tk.Toplevel):
         else:
             self.app_folder_hint.grid_remove()
         if self.winfo_ismapped():
-            self.update_idletasks()
-            if self.winfo_reqheight() != self.winfo_height():
-                initial_geometry(self, self.winfo_width(), self.winfo_reqheight(), parent=self.master)
+            self.fit_controls()
 
     def apply_theme(self, palette):
         self.palette = palette
         self.configure(background=palette.canvas)
+        self.viewport.configure(background=palette.canvas)
         ttk.Style(self).configure("TSpinbox", fieldbackground=palette.surface, foreground=palette.text,
                                   background=palette.surface, arrowcolor=palette.muted, insertcolor=palette.text,
                                   bordercolor=palette.line, lightcolor=palette.surface, darkcolor=palette.surface,

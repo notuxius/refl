@@ -728,6 +728,7 @@ class DesktopTest(unittest.TestCase):
             options = self.ui.options
             self.root.update()
             initial_height = options.winfo_height()
+            initial_requested_height = options.winfo_reqheight()
             path = options.download_path
             self.assertIsInstance(path, ttk.Label)
             self.assertEqual(path.full_text, str(self.dest))
@@ -764,7 +765,9 @@ class DesktopTest(unittest.TestCase):
             self.assertEqual(self.ui.dest, self.dest)
             self.assertEqual(path.full_text, str(next_folder))
             self.assertTrue(options.download_hint.winfo_ismapped())
-            self.assertGreater(options.winfo_height(), initial_height)
+            self.assertGreater(options.winfo_reqheight(), initial_requested_height)
+            self.assertGreaterEqual(options.winfo_height(), initial_height)
+            self.assertTrue(options.close_button.winfo_viewable())
             self.assertEqual(options.download_hint.cget("text"), "Restart Relf to use the selected folder.")
             options.close_button.invoke()
             self.ui.options_button.invoke()
@@ -779,6 +782,23 @@ class DesktopTest(unittest.TestCase):
             self.assertEqual(default_destination(), self.dest)
             self.assertFalse(options.download_hint.winfo_ismapped())
             self.assertEqual(options.winfo_height(), initial_height)
+
+    def test_options_keeps_controls_reachable_on_short_desktops(self):
+        self.root.deiconify()
+        with patch("shelf_theme.work_area", return_value=(0, 0, 1280, 600)):
+            self.ui.options_button.invoke()
+            options = self.ui.options
+            self.root.update()
+            self.assertGreater(options.winfo_reqheight(), options.winfo_height())
+            self.assertTrue(options.close_button.winfo_viewable())
+            self.assertEqual(options.viewport.yview()[0], 0)
+            last_palette = next(reversed(options.palette_buttons.values()))
+            last_palette.focus_force()
+            self.root.update()
+            self.assertGreater(options.viewport.yview()[0], 0)
+            self.assertLessEqual(last_palette.winfo_rooty() + last_palette.winfo_height(),
+                                 options.viewport.winfo_rooty() + options.viewport.winfo_height())
+            self.assertTrue(options.close_button.winfo_viewable())
 
     def assert_dropdown_join(self, trigger, menu, *, below):
         self.assertTrue(trigger.instate(["selected"]))
