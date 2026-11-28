@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "Items wey get problem with their source, file or publication go show here.",
   "Unknown": "We no know yet",
   "Pending": "Dey wait",
+  "Files in use": "Files dey in use",
   "Waiting for the app to close": "Dey wait make di app close",
   "Downgrade skipped": "Relf skip to go back to older version",
   "Kept version {installed} because {offered} is older.": "Relf keep version {installed} because {offered} old pass am.",

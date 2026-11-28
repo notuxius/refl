@@ -42,6 +42,8 @@ Double-click an item or press **Enter** on a selected row to open **Edit item** 
 
 Right-click an item and choose **Install** to run its Windows installer. If the installer is missing, Relf fetches it first, reusing a verified cached copy when available. To stop it before launch, right-click the same item and choose **Cancel**. **Install** also opens existing local EXE, MSI, MSIX, and AppX files, including MSIX and AppX bundles. For a portable EXE, the same command starts the app.
 
+For a portable ZIP, 7z, or RAR package or a local app folder, **Install** copies the app into `%LOCALAPPDATA%\Programs\<AppName>` and creates a shortcut in the current user's Start menu. If there are several candidate executables, choose which one the shortcut opens. **Open app folder** opens the installed copy after installation. Use **Get updates** to download a new package. Relf updates a running installed copy automatically. For an app that is closed, use **Install** to apply the downloaded package.
+
 The menu shows **Close and Install** when Relf detects a running instance of the item's executable. If the installed app uses a separate executable from its installer, set **Running app EXE (optional)** under **Edit item → General**. Relf asks the app to close and continues once all matching instances exit. If the app stays open, exit it using its own menu and try again.
 
 Right-click an item to choose how much to delete. Each command asks for confirmation.
@@ -82,14 +84,14 @@ python .\relf.py fetch .\recipes\my-tool.json
 | Command | Behavior |
 | --- | --- |
 | `check` | Looks up the publisher version and checks the cached files and published file. Matching size and modification time allow a quick check. It hashes files when their metadata differs or an older manifest lacks that metadata. It creates no files. |
-| `fetch` | Resolves the publisher version, verifies existing bytes using SHA-256, downloads when needed, and publishes the primary file. A damaged or missing published file can be repaired from a verified cached release. |
+| `fetch` | Resolves the publisher version, verifies existing bytes using SHA-256, downloads when needed, and publishes the primary file. Repairs reuse a verified download from an unfinished publication when available. |
 | `verify` | Works offline. Reads every cached file and the published file, compares their SHA-256 hashes with the saved manifest, and reports any mismatch or pending publication. |
 
 Batch mode prints a row per recipe and continues past individual failures. Use `--recipes PATH` to select another recipe folder. Exit code `0` means the command completed successfully. Batch `check` returns `2` for an available update, repair, or pending publication. A pending `fetch` also returns `2`. Errors and failed offline verification return `1` and take precedence. Single-recipe `check` retains its original successful exit status for an ordinary available update or repair.
 
 ## Where the files go
 
-A recipe with a shortcut name creates a shortcut under the current user's Start menu Programs folder. The shortcut opens the published executable with its folder as the working directory. If a shortcut is missing or changed, **Get updates** can recreate it from a verified local release. **Verify files** reports its condition.
+A recipe with a shortcut name creates a shortcut under the current user's Start menu Programs folder. The shortcut opens the published executable with its folder as the working directory. **Verify files** reports its condition, and **Get updates** can recreate it.
 
 Store personal files for each saved item under `recipes/companions/<recipe filename without .json>/`. Put settings, profiles, instructions, or supporting tools there using the folder layout the app expects. Right-click the item and choose **Open app folder** to open the folder containing the published working copy.
 
@@ -101,9 +103,9 @@ For a local restore action, set `restore_script` to a companion PowerShell filen
 
 When transferring to another PC, copy the whole `recipes` folder. To carry over newer working settings, copy those files from **Open app folder** back into the companion folder for that item first. A setup checklist can use a `software_folder` relative to its recipe directory to take its tools with it.
 
-Relf uses Python’s ZIP reader for selected archive members and Windows `tar.exe` for full-folder extraction. A full-folder recipe publishes supporting files alongside the executable. User-added files, such as logs, carry over when the folder is replaced. Set `extract_folder` to `.` to publish the entire archive from its root.
+Relf uses Python’s ZIP reader for selected archive members and Windows `tar.exe` for full-folder extraction. A full-folder recipe publishes supporting files alongside the executable. When the primary file is a Windows setup command such as `Install.cmd`, right-click the item and choose **Install** to run it with its supporting files. User-added files, such as logs, carry over when the folder is replaced. Set `extract_folder` to `.` to publish the entire archive from its root.
 
-For ZIPs with selected members, the first member in `extract` is the primary file unless the recipe names an executable with `publish_exe`. All selected members are published together in the managed app folder. An explicit single-file target receives the primary file and any personal companions. The original archive stays in the release cache. For archive-only recipes, the archive itself is published.
+For ZIPs with selected members, the first member in `extract` is the primary file unless the recipe names an executable with `publish_exe`. All selected members are published together in the managed app folder. An explicit single-file target receives the primary file and any personal companions. For archive-only recipes, the archive itself is published.
 
 New installations store downloads in `%USERPROFILE%\Downloads\Relf`. On upgrade, Relf keeps using an existing `Downloads\PortableFetch` or `Downloads\ReleaseShelf` folder, in that order, so shortcuts and target mappings keep working. The previous `releaseshelf.py`, `releaseshelf_ui.pyw`, and `portable_fetch.py` launchers still work.
 
@@ -117,9 +119,17 @@ To set the download folder, open **Options → Download folder → Browse…** a
 
 Set the value to the **actual executable path used by your shortcut**. You can also pass `--targets PATH` to select a settings file explicitly. Custom targets are absolute filenames outside the cache root. A fetch can replace that file. Each recipe owns one target.
 
+To publish to a dedicated app folder with the publisher's original filename, use a target such as `D:\PortableTools\My Tool\{filename}`. Use this form for full-folder archives. Relf publishes the complete package there and **Open app folder** opens that folder.
+
+Choose **Options → App folder → Browse…** and restart Relf to publish apps without a target mapping into their own folders in a separate library. Existing target mappings still point to the locations specified in `targets.json`. On the next **Get updates**, Relf publishes the working files to the selected app folder.
+
 For an ISO download, a target such as `D:\Images\Example {version}.iso` inserts the publisher version into the saved filename. When a new version is saved, Relf removes the previous ISO for that target if its SHA-256 still matches the manifest.
 
-An update is staged and validated before publication. Relf writes a temporary file alongside the target, verifies it, and atomically replaces the target. When an open app blocks the update, Relf shows **Waiting for the app to close** and keeps the verified download. The desktop app resumes the update from its cache after the app closes, including after you reopen Relf. From the command line, close the app and run `fetch` again. A manual fetch checks the publisher again. After a successful fetch, Relf keeps only the current release in `releases` and removes the previous app folder backup. Fetching an up-to-date item also clears its older cached releases. If a new version changes the published filename, Relf removes the previous managed file when its contents still match the saved checksum.
+An update is staged and validated before publication. Relf writes a temporary file alongside the target, verifies it, and atomically replaces the target. After publication succeeds, Relf removes the download for the current version from the cache. **Verify files** checks the published files against the saved SHA-256 hashes offline. A repair may download the current release again.
+
+After verifying an update, Relf asks a running app to close and keeps the download ready. If the app stays open, **Waiting for the app to close** gives you time to save changes or dismiss its prompt. Relf applies the update and reopens the app when installation succeeds. For apps that use a separate installer, set **Running app EXE (optional)** in **General** so Relf can identify and reopen the app. **Files in use** means Windows still has a file or folder open. Relf retries when it becomes available. From the command line, close the app and run `fetch` again.
+
+**Options → Previous versions to keep per app** defaults to **1**. Use the up and down arrows or type a number, then click **Save**. Set it to **0** to clear all cached downloads for an app after a successful fetch, including when the app is already up to date. If your App folder is on Google Drive, the published files are stored there through Google Drive for desktop. If a new version changes the published filename, Relf removes the previous managed file when its contents still match the saved checksum.
 
 Older ReleaseShelf manifests are supported. The first fetch with the same recipe and publisher version verifies the saved release and creates the published file. Fetch reports `Updated` when it downloads a fresh copy, `Cached` when it uses a verified saved copy to finish publication, and `Latest` when the files already match.
 

@@ -4,7 +4,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from releaseshelf import load_targets, read_destination
+from releaseshelf import (app_folder_preference_path, load_targets, previous_versions_preference_path,
+                          read_destination, validate_app_folder)
 from shelf_i18n import LANGUAGES, tr
 from shelf_icons import make_icon
 from shelf_language_menu import LanguageMenu
@@ -24,7 +25,8 @@ def read_language(path):
 
 class OptionsWindow(tk.Toplevel):
     def __init__(self, parent, mode, palette_name, on_change, palette, *, language, on_language_change,
-                 show_app_icons, on_app_icons_change, destination, destination_file):
+                 show_app_icons, on_app_icons_change, destination, destination_file, app_folder,
+                 previous_versions, on_previous_versions_change):
         super().__init__(parent)
         stage_window(self)
         self.transient(parent)
@@ -63,6 +65,38 @@ class OptionsWindow(tk.Toplevel):
         self.browse_button.grid(row=0, column=1, padx=(6, 0), sticky="e")
         self.download_hint = ttk.Label(downloads, wraplength=390, style="Muted.TLabel", font=("Segoe UI", 9))
         self.download_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.app_folder = app_folder
+        self.app_folder_file = app_folder_preference_path()
+        try:
+            self.selected_app_folder = read_destination(self.app_folder_file) or app_folder
+        except (OSError, ValueError):
+            self.selected_app_folder = app_folder
+        self.app_folder_heading = ttk.Label(body, font=heading_font)
+        self.app_folder_heading.pack(anchor="w")
+        app_location = ttk.Frame(body)
+        app_location.pack(fill="x", pady=(6, 12))
+        app_location.columnconfigure(0, weight=1)
+        self.app_folder_path = FittedLabel(app_location, anchor="w", takefocus=False)
+        self.app_folder_path.grid(row=0, column=0, sticky="ew")
+        self.app_folder_browse = ttk.Button(app_location, command=self.choose_app_folder)
+        self.app_folder_browse.grid(row=0, column=1, padx=(6, 0))
+        self.app_folder_hint = ttk.Label(app_location, wraplength=390, style="Muted.TLabel", font=("Segoe UI", 9))
+        self.app_folder_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.on_previous_versions_change = on_previous_versions_change
+        self.previous_versions = tk.StringVar(self, value=str(previous_versions))
+        retention = ttk.Frame(body)
+        retention.pack(fill="x", pady=(0, 12))
+        retention.columnconfigure(0, weight=1)
+        self.previous_versions_label = ttk.Label(retention)
+        self.previous_versions_label.grid(row=0, column=0, sticky="w")
+        self.previous_versions_entry = ttk.Spinbox(retention, from_=0, to=float("inf"), width=5,
+                                                  textvariable=self.previous_versions)
+        self.previous_versions_entry.grid(row=0, column=1, padx=6)
+        self.previous_versions_entry.bind("<Return>", lambda _: self.save_previous_versions())
+        self.save_previous_versions_button = ttk.Button(retention, command=self.save_previous_versions)
+        self.save_previous_versions_button.grid(row=0, column=2)
 
         self.appearance_heading = ttk.Label(body, font=heading_font)
         self.appearance_heading.pack(anchor="w")
@@ -113,6 +147,10 @@ class OptionsWindow(tk.Toplevel):
         self.language_menu.select(code)
         self.download_heading.configure(text=tr("Download folder"))
         self.browse_button.configure(text=tr("Browse…"))
+        self.app_folder_heading.configure(text=tr("App folder"))
+        self.app_folder_browse.configure(text=tr("Browse…"))
+        self.previous_versions_label.configure(text=tr("Previous versions to keep per app"))
+        self.save_previous_versions_button.configure(text=tr("Save"))
         self.update_download_hint()
         self.appearance_heading.configure(text=tr("Appearance"))
         self.app_icons_button.configure(text=tr("Show item icons"))
@@ -132,6 +170,8 @@ class OptionsWindow(tk.Toplevel):
             return
         try:
             destination = Path(folder).resolve(strict=True)
+            if self.selected_app_folder is not None:
+                validate_app_folder(self.selected_app_folder, destination)
             load_targets(destination / "targets.json", destination)
             write_preference(self.destination_file, f"{destination}\n")
         except (OSError, TypeError, ValueError) as exc:
@@ -142,6 +182,38 @@ class OptionsWindow(tk.Toplevel):
         self.download_path.set_text(str(destination))
         self.update_download_hint()
 
+    def choose_app_folder(self):
+        folder = filedialog.askdirectory(parent=self, title=tr("App folder"),
+                                         initialdir=str(self.selected_app_folder or Path.home()), mustexist=True)
+        if not folder:
+            return
+        try:
+            app_folder = validate_app_folder(Path(folder).resolve(strict=True), self.download_folder)
+            write_preference(self.app_folder_file, f"{app_folder}\n")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(tr("App folder"), tr("Could not save preference: {error}",
+                                                     error=error_detail(exc)), parent=self)
+            return
+        self.selected_app_folder = app_folder
+        self.update_download_hint()
+
+    def save_previous_versions(self):
+        title = tr("Previous versions to keep per app")
+        try:
+            count = int(self.previous_versions.get())
+            if count < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(title, tr("Enter a non-negative number of previous versions."), parent=self)
+            return
+        try:
+            write_preference(previous_versions_preference_path(), f"{count}\n")
+        except OSError as exc:
+            messagebox.showerror(title, tr("Could not save preference: {error}", error=error_detail(exc)), parent=self)
+            return
+        self.previous_versions.set(str(count))
+        self.on_previous_versions_change(count)
+
     def update_download_hint(self):
         pending = self.download_folder != self.destination
         if pending:
@@ -149,6 +221,13 @@ class OptionsWindow(tk.Toplevel):
             self.download_hint.grid()
         else:
             self.download_hint.grid_remove()
+        self.app_folder_path.set_text(str(self.selected_app_folder) if self.selected_app_folder is not None
+                                      else tr("Use download folder"))
+        if self.selected_app_folder != self.app_folder:
+            self.app_folder_hint.configure(text=tr("Restart Relf to use the selected folder."))
+            self.app_folder_hint.grid()
+        else:
+            self.app_folder_hint.grid_remove()
         if self.winfo_ismapped():
             self.update_idletasks()
             if self.winfo_reqheight() != self.winfo_height():
@@ -157,6 +236,10 @@ class OptionsWindow(tk.Toplevel):
     def apply_theme(self, palette):
         self.palette = palette
         self.configure(background=palette.canvas)
+        ttk.Style(self).configure("TSpinbox", fieldbackground=palette.surface, foreground=palette.text,
+                                  background=palette.surface, arrowcolor=palette.muted, insertcolor=palette.text,
+                                  bordercolor=palette.line, lightcolor=palette.surface, darkcolor=palette.surface,
+                                  selectbackground=palette.text, selectforeground=palette.surface, padding=4)
         self.close_icon = make_icon(self, "cancel", palette.text)
         self.close_button.configure(image=self.close_icon)
         self.language_icon = make_icon(self, "language", palette.accent)

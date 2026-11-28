@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "العناصر اللي فيها مشكلة في المصدر أو الملفات أو النشر بتظهر هنا.",
   "Unknown": "مش معروف",
   "Pending": "مستني",
+  "Files in use": "الملفات قيد الاستخدام",
   "Waiting for the app to close": "مستني التطبيق يتقفل",
   "Downgrade skipped": "اتخطّى الرجوع لإصدار أقدم",
   "Kept version {installed} because {offered} is older.": "خلّينا الإصدار {installed} عشان الإصدار {offered} أقدم.",

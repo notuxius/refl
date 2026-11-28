@@ -91,16 +91,20 @@ class WindowsProcesses:
             yield matches
 
     def request_close(self, matches):
+        requested = False
+
         @self.window_callback
         def close_window(window, _):
+            nonlocal requested
             pid = win.DWORD()
             # Leave owned windows such as save prompts to the app's normal close flow.
             if not self.get_window(window, GW_OWNER) and self.window_process(window, ctypes.byref(pid)):
-                if pid.value in matches:
-                    self.post_message(window, WM_CLOSE, 0, 0)
+                if pid.value in matches and self.post_message(window, WM_CLOSE, 0, 0):
+                    requested = True
             return True
 
         self.enum_windows(close_window, 0)
+        return requested
 
 
 @cache
@@ -113,6 +117,14 @@ def app_is_running(path):
         return False
     with windows_processes().matching(path) as matches:
         return bool(matches)
+
+
+def request_app_close(path):
+    if os.name != "nt":
+        return False
+    api = windows_processes()
+    with api.matching(path) as matches:
+        return bool(matches) and api.request_close(matches)
 
 
 def close_running_app(path, *, timeout=15):

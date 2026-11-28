@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "Тут відображаються елементи з помилками джерела, файлів або публікації.",
   "Unknown": "Невідомо",
   "Pending": "Очікує",
+  "Files in use": "Файли використовуються",
   "Waiting for the app to close": "Очікування закриття програми",
   "Downgrade skipped": "Зниження версії пропущено",
   "Kept version {installed} because {offered} is older.": "Версію {installed} залишено, оскільки версія {offered} старіша.",

@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "ソース、ファイル、または公開処理に問題がある項目がここに表示されます。",
   "Unknown": "不明",
   "Pending": "保留中",
+  "Files in use": "ファイルを使用中",
   "Waiting for the app to close": "アプリが閉じるのを待っています",
   "Downgrade skipped": "ダウングレードをスキップしました",
   "Kept version {installed} because {offered} is older.": "{offered} は古いバージョンのため、{installed} を維持しました。",

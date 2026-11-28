@@ -13,7 +13,7 @@ from pathlib import Path
 from queue import Empty, Queue
 import re
 import sys
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import tkinter as tk
 from tkinter import font as tkfont, ttk
 from urllib.parse import urlsplit
@@ -21,12 +21,15 @@ from urllib.parse import urlsplit
 from checklist_window import ChecklistWindow
 from companion_buttons import install_and_restore
 from fetch_sources import Recipe
-from fetch_store import (DOWNGRADE_SKIPPED, WAITING_FOR_CLOSE, Result, apply_published_settings,
-                         file_in_use, pending_result, read_state)
+from fetch_store import (DOWNGRADE_SKIPPED, FILES_IN_USE, WAITING_FOR_CLOSE, Result, apply_published_settings,
+                         file_in_use, is_folder_target, pending_result, read_state, target_for_version)
 from recipe_editor import ACTIONS, ACTION_ICONS, RecipeEditor, save_recipe
-from releaseshelf import (ERRORS, GITHUB_PAUSED, MAX_PARALLEL_ITEMS, UPDATE_RETRY_DELAYS, ChecklistLoadError,
-                          add_recipes_argument, batch_map, default_destination, destination_preference_path,
-                          execute, load_targets, local_result, prepare_fetch, read_jobs, updates_disabled)
+from releaseshelf import (DEFAULT_PREVIOUS_VERSIONS, ERRORS, GITHUB_PAUSED, MAX_PARALLEL_ITEMS,
+                          UPDATE_RETRY_DELAYS, ChecklistLoadError,
+                          add_recipes_argument, app_folder_preference_path, batch_map, default_destination,
+                          destination_preference_path, execute, load_targets, local_result, prepare_fetch,
+                          previous_versions_preference_path, read_destination, read_jobs, read_previous_versions,
+                          target_for_job, updates_disabled, validate_app_folder)
 from shelf_app_icons import ICON_SIZE, cache_store_logo, fetch_store_logo, run_icon_loader, store_product_id
 from shelf_cancel import JobCanceled
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
@@ -39,6 +42,7 @@ from shelf_menu import AppMenu, DropdownMenu
 from shelf_message import error_detail, message
 from shelf_options import OptionsWindow, read_language
 from shelf_paint import keep_view_visible, show_window, stage_window
+from shelf_portable_install import PORTABLE_ARCHIVES, install_portable_item, installed_launcher, portable_folder
 from shelf_progress import DownloadProgress
 from shelf_running_app import app_is_running, close_running_app
 from shelf_scroll import grid_horizontal_scrollbar, grid_scrollable
@@ -59,9 +63,9 @@ VIEWS = {"checklist": "Checklist", "all": "Tracked", "local": "Local only", "upd
 WORKING = {"check": "Checking", "fetch": "Updating", "resume": "Updating", "verify": "Verifying", "apply": "Applying"}
 RESULT_STATUSES = ("Unknown", "Pending", "Error", "Latest", "Updated", "Cached",
                    "Repair needed", "Update available", "Source error", "Verified", "Disabled", "Local only",
-                   WAITING_FOR_CLOSE, DOWNGRADE_SKIPPED)
+                   WAITING_FOR_CLOSE, FILES_IN_USE, DOWNGRADE_SKIPPED)
 SUMMARY_STATUSES = ("Updated", "Cached", "Latest", "Verified", "Applied",
-                    "Partially applied", "Update available", "Pending", WAITING_FOR_CLOSE,
+                    "Partially applied", "Update available", "Pending", WAITING_FOR_CLOSE, FILES_IN_USE,
                     DOWNGRADE_SKIPPED, "Repair needed", "Error")
 PUBLICATION_RETRY_MS = 2000
 COLUMN_WIDTHS = {"Name": 126, "Category": 100, "Local version": 94,
@@ -70,7 +74,7 @@ MIN_COLUMN_WIDTH = 80
 SORTABLE_COLUMNS = ("Name", "Category", "Status")
 SEARCH_CHAR_LIMIT = 64
 SIDEBAR_FOOTER_GAP = 3
-INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle"}
+INSTALLABLE_SUFFIXES = PORTABLE_ARCHIVES | {".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle", ".cmd"}
 ASSETS = Path(__file__).resolve().parent / "assets"
 CHECK_RELF_UPDATES = "Check for Relf updates"
 RELF_UPDATE_CHECK_MS = 24 * 60 * 60 * 1000
@@ -193,19 +197,6 @@ def eligible_for_action(action, job):
             and (action == "verify" or not updates_disabled(job)))
 
 
-def installer_path(job, dest):
-    if isinstance(job, LocalItem):
-        path = job.path
-    elif isinstance(job, Recipe):
-        state = read_state(job.cache_root(dest), "current.json") or {}
-        path = Path(state.get("published", {}).get("path", ""))
-    else:
-        return None
-    if path.is_absolute() and path.suffix.lower() in INSTALLER_SUFFIXES:
-        return path
-    return None
-
-
 def display_app_version(version):
     return re.sub(r"^[vV](?=[0-9])", "", str(version))
 
@@ -229,7 +220,51 @@ def initial_result(job, dest, checklist_history):
     return Result("Unknown", local)
 
 
-def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
+def update_app_path(job, package, previous):
+    suffix = package.suffix.lower()
+    if suffix not in INSTALLABLE_SUFFIXES:
+        return None
+    if job.running_exe:
+        return job.running_exe
+    if suffix in PORTABLE_ARCHIVES:
+        with suppress(*ERRORS):
+            return installed_launcher(job.name or job.id, job.id_keys())
+    if suffix == ".exe":
+        if previous.is_absolute() and previous.parent == package.parent and previous.suffix.lower() == ".exe":
+            return previous
+        return package
+    return None
+
+
+def install_downloaded_update(job, recipe_path, dest, update, choose_launcher):
+    app, package = update.app, update.package
+    if app_is_running(app):
+        raise ValueError(message("{name} is still running. Exit it and try Install again.", name=job.name or job.id))
+    if package != app:
+        if package.suffix.lower() in PORTABLE_ARCHIVES:
+            app = install_portable_item(job, package, dest, choose_launcher)
+            if app is None:
+                return False
+        else:
+            restore = job.companions.after_install
+            code = install_and_restore(package, job, recipe_path, dest, restore and job.has_portable_settings(),
+                                       restore_companions=restore)
+            if code in (1641, 3010):
+                raise ValueError(message("Restart Windows to finish installing {name}.", name=job.name or job.id))
+    if not app_is_running(app):
+        os.startfile(app, cwd=app.parent)
+    return True
+
+
+def run_batch(events, action, items, dest, targets_path, *, retry_delays=(), app_folder=None, previous_versions=0):
+    storage = {"app_folder": app_folder, "targets_path": targets_path, "previous_versions": previous_versions}
+    install_lock = Lock()
+
+    def choose_launcher(choices):
+        response = Queue()
+        events.put(("choose_launcher", choices, response))
+        return response.get()
+
     def process(item):
         index, (key, job, cancel_event) = item
         if cancel_event.is_set():
@@ -238,7 +273,8 @@ def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
             return result
         events.put(("started", key, "check" if action == "fetch" else action, index))
         if action != "fetch":
-            result = execute(action, job, dest, targets, cancel_event=cancel_event)
+            result = execute(action, job, dest, targets, cancel_event=cancel_event,
+                             update_app_path=update_app_path if action == "resume" else None, **storage)
         else:
             def retry():
                 events.put(("retry", key))
@@ -247,10 +283,18 @@ def run_batch(events, action, items, dest, targets_path, *, retry_delays=()):
                 events.put(("progress", key, received, total))
 
             result = prepare_fetch(job, dest, targets, cancel_event=cancel_event, retry_delays=retry_delays,
-                                   on_retry=retry)
+                                   on_retry=retry, update_app_path=update_app_path, **storage)
             if not isinstance(result, Result):
                 events.put(("prepared", key))
-                result = result.run(on_progress=progress, cancel_event=cancel_event, on_retry=retry)
+                result = result.run(on_progress=progress, cancel_event=cancel_event, on_retry=retry,
+                                    update_app_path=update_app_path)
+        if result.app_update and result.status in ("Updated", "Cached"):
+            try:
+                with install_lock:
+                    if not install_downloaded_update(job, Path(key), dest, result.app_update, choose_launcher):
+                        result = Result("Cached", result.local, result.available, message("Canceled"))
+            except ERRORS as exc:
+                result = Result("Error", result.local, result.available, error_detail(exc))
         events.put(("result", key, result))
         return result
 
@@ -297,8 +341,10 @@ def run_checklists(events, items, history):
 
 
 class ShelfWindow:
-    def __init__(self, root, catalog, dest, targets, *, appearance_file=None):
+    def __init__(self, root, catalog, dest, targets, *, appearance_file=None, app_folder=None,
+                 previous_versions=DEFAULT_PREVIOUS_VERSIONS):
         self.root, self.catalog, self.dest, self.targets = root, catalog, dest, targets
+        self.app_root, self.previous_versions = app_folder, previous_versions
         self.jobs, self.results = {}, {}
         self.checked_items = set()
         self.busy = False
@@ -530,7 +576,6 @@ class ShelfWindow:
         footer.columnconfigure(0, weight=1)
         self.options_button = ttk.Button(footer, text="Options", command=self.open_options,
                                          style="Nav.TButton", compound="left")
-        footer.bind("<Configure>", lambda _: self.fit_sidebar_button(self.options_button))
         self.icon_widgets[self.options_button] = ("settings", "text", 20)
 
         self.sidebar_toggle = ttk.Button(footer, text="Collapse sidebar", compound="image",
@@ -561,7 +606,7 @@ class ShelfWindow:
 
     def position_sidebar_toggle(self):
         padding = 2 if self.sidebar_compact else (4, 2)
-        self.options_button.grid(row=1, column=0, sticky="ew" if self.sidebar_compact else "w", pady=padding)
+        self.options_button.grid(row=1, column=0, sticky="ew", pady=padding)
         if self.sidebar_compact:
             self.sidebar_grip.place_forget()
             self.sidebar_toggle.configure(padding="")
@@ -585,8 +630,6 @@ class ShelfWindow:
         if tuple(map(int, button["padding"])) != padding:
             button.configure(padding=padding)
         available = button.winfo_width()
-        if button is self.options_button and self.sidebar_footer.winfo_width() > 1:
-            available = self.sidebar_footer.winfo_width() - self.sidebar_toggle.winfo_reqwidth() - SIDEBAR_FOOTER_GAP
         if available > 1 and button in self.images:
             font = self.style.lookup("Nav.TButton", "font")
             gap = int(self.style.lookup("Nav.TButton", "space"))
@@ -1474,7 +1517,9 @@ class ShelfWindow:
             self.options = OptionsWindow(self.root, self.mode, self.palette_name, self.change_mode, self.palette,
                                          language=self.language, on_language_change=self.change_language,
                                          show_app_icons=self.show_app_icons, on_app_icons_change=self.change_app_icons,
-                                         destination=self.dest, destination_file=destination_preference_path())
+                                         destination=self.dest, destination_file=destination_preference_path(),
+                                         app_folder=self.app_root, previous_versions=self.previous_versions,
+                                         on_previous_versions_change=self.change_previous_versions)
             self.options.bind("<Destroy>", self.options_closed, add="+")
             show_window(self.options)
         else:
@@ -1485,6 +1530,9 @@ class ShelfWindow:
     def options_closed(self, event):
         if event.widget is self.options:
             self.options = None
+
+    def change_previous_versions(self, count):
+        self.previous_versions = count
 
     def change_language(self, code):
         set_language(code)
@@ -1814,7 +1862,7 @@ class ShelfWindow:
         name = self.name(key)
         try:
             original = path.read_bytes()
-            plan = deletion_plan(mode, path, job, self.dest, self.targets)
+            plan = deletion_plan(mode, path, job, self.dest, self.targets, app_folder=self.app_root)
             detail = [tr("All item files will be kept.")]
             paths = ()
             if mode == FOLDER:
@@ -1825,7 +1873,7 @@ class ShelfWindow:
             if not deletion_dialog(self.root, self.palette, mode, name, "\n".join(detail), paths):
                 return
             try:
-                delete_item(mode, path, job, original, plan, self.dest, self.targets)
+                delete_item(mode, path, job, original, plan, self.dest, self.targets, app_folder=self.app_root)
             finally:
                 self.app_menu_key = None
                 self.reload()
@@ -1888,36 +1936,57 @@ class ShelfWindow:
 
         CategoryDialog(self.root, self.palette, RENAME if rename else MOVE, subject, source, choices, save)
 
+    def installer_path(self, job):
+        if isinstance(job, LocalItem):
+            path = job.path
+        elif isinstance(job, Recipe):
+            state = read_state(job.cache_root(self.dest), "current.json")
+            if not state:
+                return None
+            path = Path(state.get("published", {}).get("path", ""))
+            target = self.configured_target(job)
+            if is_folder_target(target):
+                if path.parent != target.parent:
+                    return None
+            elif target is not None and path != target_for_version(target, state["version"]):
+                return None
+        else:
+            return None
+        if path.is_absolute() and (path.suffix.lower() in INSTALLABLE_SUFFIXES
+                                   or (isinstance(job, LocalItem) and path.is_dir())):
+            return path
+        return None
+
     def can_install(self, job):
         try:
-            path = installer_path(job, self.dest)
-            if path and path.is_file():
+            path = self.installer_path(job)
+            if path and path.exists():
                 return True
             if not isinstance(job, Recipe) or updates_disabled(job):
                 return False
-            targets = load_targets(self.targets, self.dest)
-            mapped = next((targets[key] for key in job.id_keys() if key in targets), None)
-            if mapped:
-                return mapped.suffix.lower() in INSTALLER_SUFFIXES
+            mapped = self.configured_target(job)
+            if mapped and not is_folder_target(mapped):
+                return mapped.suffix.lower() in INSTALLABLE_SUFFIXES
             primary = job.primary(job.archive or job.asset_pattern)
             suffix = Path(primary).suffix.lower()
             # A GitHub glob can leave the extension unknown until the asset is resolved.
             unknown_suffix = primary == job.asset_pattern and any(c in (suffix or primary) for c in "*?[")
-            return bool(path or suffix in INSTALLER_SUFFIXES or unknown_suffix)
+            return bool(path or suffix in INSTALLABLE_SUFFIXES or unknown_suffix)
         except ERRORS:
             return False
 
     def running_app_path(self, job):
         try:
             path = job.running_exe
-            if path is None and isinstance(job, Recipe):
-                targets = load_targets(self.targets, self.dest)
-                mapped = [targets[key] for key in job.id_keys() if key in targets]
-                if len(mapped) > 1:
-                    return None
-                path = mapped[0] if mapped else None
             if path is None:
-                path = installer_path(job, self.dest)
+                with suppress(*ERRORS):
+                    path = installed_launcher(job.name or job.id, job.id_keys())
+            if path is None and isinstance(job, Recipe):
+                path = self.configured_target(job)
+                if is_folder_target(path):
+                    path = None
+            if path is None:
+                path = self.installer_path(job)
             if path and path.suffix.lower() == ".exe" and app_is_running(path):
                 return path
         except ERRORS:
@@ -1933,9 +2002,19 @@ class ShelfWindow:
         if key not in self.jobs or key in self.installing:
             return
         path = self.app_menu_close_path
+        job = self.jobs[key]
+        if self.results[key].app_update and self.results[key].status == "Pending":
+            self.schedule_pending_updates()
+            return
         if path is None:
             self.open_installer(key, fetch_missing=True)
             return
+        if isinstance(job, Recipe) and not self.results[key].locked_path:
+            with suppress(*ERRORS):
+                package = self.installer_path(job)
+                if (package is None or not package.exists()) and not updates_disabled(job):
+                    self.open_installer(key, fetch_missing=True)
+                    return
 
         finished = Queue()
         name = self.name(key)
@@ -1975,7 +2054,10 @@ class ShelfWindow:
             if fetch_missing and self.results[key].locked_path is not None and not updates_disabled(job):
                 self.start("resume", key=key, install=True)
                 return
-            path = installer_path(job, self.dest)
+            path = self.installer_path(job)
+            if path and (path.is_dir() or (path.is_file() and path.suffix.lower() in PORTABLE_ARCHIVES)):
+                self.install_portable_app(key, path)
+                return
             if path and path.is_file():
                 if key in self.installing:
                     return
@@ -2008,6 +2090,85 @@ class ShelfWindow:
         except ERRORS as exc:
             self.set_status("{error}", error=error_detail(exc))
 
+    def choose_portable_launcher(self, choices):
+        dialog = tk.Toplevel(self.root)
+        stage_window(dialog)
+        dialog.title(tr("Choose an executable"))
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=tr("Choose the executable for the Start menu shortcut.")).pack(anchor="w")
+        choice = ttk.Combobox(frame, values=choices, state="readonly", width=50)
+        choice.pack(fill="x", pady=8)
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="e")
+        selected = None
+
+        def confirm():
+            nonlocal selected
+            if choice.get() in choices:
+                selected = choice.get()
+                dialog.destroy()
+
+        ttk.Button(buttons, text=tr("Cancel"), command=dialog.destroy).pack(side="left", padx=(0, 8))
+        install = ttk.Button(buttons, text=tr("Install"), command=confirm, style="Primary.TButton", state="disabled")
+        install.pack(side="left")
+        choice.bind("<<ComboboxSelected>>", lambda _: install.state(["!disabled"]))
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        dialog.bind("<Return>", lambda _: confirm())
+        initial_geometry(dialog, 0, 0, parent=self.root)
+        style_titlebar(dialog, self.palette.is_dark)
+        show_window(dialog)
+        dialog.grab_set()
+        choice.focus_set()
+        self.root.wait_window(dialog)
+        return selected
+
+    def install_portable_app(self, key, path):
+        job, name = self.jobs[key], self.name(key)
+        events, response = Queue(), Queue()
+
+        def choose(choices):
+            events.put((choices, None, None))
+            return response.get()
+
+        def install():
+            try:
+                installed = install_portable_item(job, path, self.dest, choose)
+            except Exception as exc:
+                events.put((None, None, error_detail(exc)))
+            else:
+                events.put((None, installed, None))
+
+        def poll():
+            try:
+                choices, installed, error = events.get_nowait()
+            except Empty:
+                self.root.after(50, poll)
+                return
+            if choices:
+                selected = None
+                try:
+                    selected = self.choose_portable_launcher(choices)
+                finally:
+                    response.put(selected)
+                    self.root.after(50, poll)
+                return
+            self.busy = False
+            self.controls()
+            if error is not None:
+                self.set_status("Could not finish: {error}", error=error)
+            elif installed is not None:
+                self.set_status("Installed {name}.", name=name)
+            else:
+                self.set_status("Canceled")
+
+        self.busy = True
+        self.controls()
+        self.set_status("Installing {name}…", name=name)
+        Thread(target=install).start()
+        self.root.after(50, poll)
+
     def finish_install(self, key, finished):
         try:
             error = finished.get_nowait()
@@ -2022,11 +2183,16 @@ class ShelfWindow:
                             label=message("Install"), finished=1, total=1)
         self.controls()
 
+    def configured_target(self, job):
+        return target_for_job(job, load_targets(self.targets, self.dest), self.dest, self.app_root, self.targets)
+
     def app_folder(self, job):
+        with suppress(*ERRORS):
+            if installed_launcher(job.name or job.id, job.id_keys()):
+                return portable_folder(job.name or job.id, job.id)
         if isinstance(job, LocalItem):
             return job.path if job.path.is_dir() else job.path.parent
-        targets = load_targets(self.targets, self.dest)
-        mapped = next((targets[key] for key in job.id_keys() if key in targets), None)
+        mapped = self.configured_target(job)
         if mapped:
             return mapped.parent
         state = read_state(job.cache_root(self.dest), "current.json") or {}
@@ -2162,7 +2328,8 @@ class ShelfWindow:
 
     def schedule_pending_updates(self):
         if self.publication_timer is None and any(
-                result.locked_path is not None and not updates_disabled(self.jobs[key])
+                (result.locked_path or result.app_update) and result.status == "Pending"
+                and not updates_disabled(self.jobs[key])
                 for key, result in self.results.items()):
             self.publication_timer = self.root.after(PUBLICATION_RETRY_MS, self.check_pending_updates)
 
@@ -2171,22 +2338,38 @@ class ShelfWindow:
         if self.busy or self.installing:
             self.schedule_pending_updates()
             return
-        waiting = {key: result.locked_path for key, result in self.results.items()
-                   if result.locked_path is not None and not updates_disabled(self.jobs[key])}
+        waiting = {key: result for key, result in self.results.items()
+                   if (result.locked_path or result.app_update) and result.status == "Pending"
+                   and not updates_disabled(self.jobs[key])}
         if not waiting:
             return
         ready = Queue()
 
         def check():
-            ready.put([key for key, path in waiting.items() if not file_in_use(path)])
+            statuses = {}
+            unlocked = []
+            for key, result in waiting.items():
+                try:
+                    closing = bool(result.app_update and app_is_running(result.app_update.app))
+                    if not closing and (result.locked_path is None or not file_in_use(result.locked_path)):
+                        unlocked.append(key)
+                    elif closing != result.waiting_for_close:
+                        statuses[key] = closing
+                except OSError:
+                    continue
+            ready.put((unlocked, statuses))
 
         def finish():
             if ready.empty():
                 self.publication_timer = self.root.after(50, finish)
                 return
             self.publication_timer = None
-            keys = [key for key in ready.get_nowait() if key in self.results
-                    and self.results[key].locked_path == waiting[key]]
+            unlocked, statuses = ready.get_nowait()
+            for key, closing in statuses.items():
+                if self.results.get(key) is waiting[key]:
+                    waiting[key].waiting_for_close = closing
+                    self.paint(key)
+            keys = [key for key in unlocked if self.results.get(key) is waiting[key]]
             if keys and not self.installing:
                 self.start("resume", keys=keys)
             self.schedule_pending_updates()
@@ -2488,7 +2671,8 @@ class ShelfWindow:
             self.set_status("{action}…", action=message(WORKING[action]))
             delays = UPDATE_RETRY_DELAYS if self.bulk_action == "fetch" else ()
             Thread(target=run_batch, args=(self.events, action, items, self.dest, self.targets),
-                   kwargs={"retry_delays": delays}).start()
+                   kwargs={"retry_delays": delays, "app_folder": self.app_root,
+                           "previous_versions": self.previous_versions}).start()
         label = ACTIONS["fetch"] if action == "resume" else (ALL_ACTIONS if key is None else ACTIONS)[action]
         if install:
             label = "Install"
@@ -2561,7 +2745,7 @@ class ShelfWindow:
                 self.transfers.pop(key, None)
                 self.pending_downloads.discard(key)
                 self.unresolved_checks.discard(key)
-                if key == self.install_key and self.cancel_events[key].is_set():
+                if key == self.install_key and (self.cancel_events[key].is_set() or result.app_update):
                     self.install_key = None
                 del self.cancel_events[key]
                 if result.status == "Canceled":
@@ -2578,6 +2762,13 @@ class ShelfWindow:
                             self.set_app_icon(key)
                 self.paint(key)
                 view_changed = True
+            elif event == "choose_launcher":
+                choices, response = data
+                selected = None
+                try:
+                    selected = self.choose_portable_launcher(choices)
+                finally:
+                    response.put(selected)
             elif event == "failed":
                 self.failure = data[0]
                 if self.editor is not None:
@@ -2640,11 +2831,17 @@ def main():
     parser.add_argument("--targets", type=Path)
     args = parser.parse_args()
     dest = (args.dest or default_destination()).resolve()
+    app_folder = read_destination(app_folder_preference_path()) if args.dest is None else None
+    previous_versions = (read_previous_versions(previous_versions_preference_path())
+                         if args.dest is None else DEFAULT_PREVIOUS_VERSIONS)
+    if app_folder is not None:
+        app_folder = validate_app_folder(app_folder.resolve(), dest)
     if sys.platform == "win32":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Relf.Desktop")
     root = tk.Tk()
     stage_window(root)
-    window = ShelfWindow(root, args.recipes.resolve(), dest, args.targets or dest / "targets.json")
+    window = ShelfWindow(root, args.recipes.resolve(), dest, args.targets or dest / "targets.json",
+                         app_folder=app_folder, previous_versions=previous_versions)
     show_window(root)
     try:
         if failure := finish_relaunch():

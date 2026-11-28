@@ -17,8 +17,9 @@ from threading import Lock
 from time import sleep
 
 from fetch_sources import GitHubRateLimited, Recipe, Release, defer_github_checks, filename, github_wait_seconds
-from fetch_store import (DOWNGRADE_SKIPPED, ISO_VERSION, Result, fetch_lock, is_versioned_iso_target, matches, read_state,
-                         resume_publication, run_release, verify)
+from fetch_store import (DOWNGRADE_SKIPPED, ISO_VERSION, Result, check_link, fetch_lock, is_folder_target,
+                         is_versioned_iso_target, matches, previous_app_folder, read_state, resume_publication,
+                         run_release, verify)
 from shelf_cancel import JobCanceled, cancel_scope, check_canceled, publisher_backpressure, publisher_items
 from shelf_checklist import Checklist, LocalItem, catalog_item
 from shelf_message import error_detail, message
@@ -32,6 +33,7 @@ START_PARALLEL_ITEMS = 3
 MAX_PARALLEL_ITEMS = 6
 UPDATE_RETRY_DELAYS = (1, 2, 4)
 GITHUB_PAUSED = "Waiting for GitHub rate limit reset…"
+DEFAULT_PREVIOUS_VERSIONS = 1
 
 
 def batch_map(action, worker, items, *, on_github_pause=None, is_canceled=None):
@@ -142,6 +144,45 @@ def default_destination():
     return downloads / "Relf"
 
 
+def app_folder_preference_path():
+    return destination_preference_path().with_name("app-folder.txt")
+
+
+def previous_versions_preference_path():
+    return destination_preference_path().with_name("previous-versions.txt")
+
+
+def read_previous_versions(path):
+    try:
+        value = int(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return DEFAULT_PREVIOUS_VERSIONS
+    if value < 0:
+        raise ValueError("Enter a non-negative number of previous versions.")
+    return value
+
+
+def validate_app_folder(folder, dest):
+    if folder.is_relative_to(dest) or dest.is_relative_to(folder):
+        raise ValueError(message("Choose an app folder separate from the download folder: {path}", path=folder))
+    return folder
+
+
+def validate_folder_target(target, dest, settings, others):
+    live = target.parent
+    backup = previous_app_folder(dest, live)
+    protected = (dest, settings, APP_DIR, Path.home().resolve())
+    if system_root := os.environ.get("SystemRoot"):
+        protected += (Path(system_root).resolve(),)
+    if (live == live.parent
+            or any(part.is_relative_to(live) or part.is_relative_to(backup) for part in protected)
+            or any(other != target and (other.is_relative_to(live) or other.is_relative_to(backup)
+                                        or (is_folder_target(other) and target.is_relative_to(other.parent)))
+                   for other in others)):
+        raise ValueError(message("Choose a dedicated app folder outside Relf storage and other targets: {path}",
+                                 path=live))
+
+
 def load_targets(path, dest):
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -160,7 +201,10 @@ def load_targets(path, dest):
         if not target.is_absolute() or not target.name:
             raise ValueError(message("Use an absolute target filename for {job}", job=job))
         filename(target.name)
-        target = target.parent.resolve() / target.name if is_versioned_iso_target(target) else target.resolve()
+        folder_target = is_folder_target(target)
+        if folder_target:
+            check_link(target.parent)
+        target = target.parent.resolve() / target.name if folder_target or is_versioned_iso_target(target) else target.resolve()
         if target.is_relative_to(dest) or target == settings:
             raise ValueError(message("Custom targets must be outside the managed download folder and settings file: "
                                      "{target}", target=target))
@@ -169,6 +213,9 @@ def load_targets(path, dest):
                                      path=path, job=job, target=target))
         targets[key] = target
         owners[target] = job
+    for target in owners:
+        if is_folder_target(target):
+            validate_folder_target(target, dest, settings, owners)
     for target in (*owners, settings):
         if target.suffix.lower() != ".iso" or is_versioned_iso_target(target):
             continue
@@ -178,12 +225,34 @@ def load_targets(path, dest):
     return targets
 
 
-def run_job(action, recipe, dest, target, on_progress=None, *, prepared=None, defer_download=False):
+def target_for_job(job, targets, dest, app_folder=None, settings=None):
+    keys = [key for key in job.id_keys() if key in targets]
+    if len(keys) > 1:
+        raise ValueError(message("Multiple target mappings for {app}: {keys}. "
+                                 "Keep one mapping for this item in the targets file.",
+                                 app=job.id, keys=", ".join(keys)))
+    if keys:
+        return targets[keys[0]]
+    if app_folder is not None:
+        folder = validate_app_folder(app_folder, dest) / job.cache_root(dest).name
+        check_link(folder)
+        target = folder / "{filename}"
+        if target in targets.values():
+            raise ValueError(message("Choose a dedicated app folder outside Relf storage and other targets: {path}",
+                                     path=folder))
+        validate_folder_target(target, dest, settings or dest / "targets.json", targets.values())
+        return target
+    return None
+
+
+def run_job(action, recipe, dest, target, on_progress=None, *, prepared=None, defer_download=False,
+            previous_versions=0, update_app_path=None):
     root = recipe.cache_root(dest)
     if action == "verify":
         return verify(root, recipe, target)
     if action == "resume":
-        return resume_publication(root, recipe, target)
+        return resume_publication(root, recipe, target, previous_versions=previous_versions,
+                                  update_app_path=update_app_path)
     with fetch_lock(root) if action == "fetch" else nullcontext():
         state = read_state(root, "current.json")
         local = state["version"] if state else "-"
@@ -196,11 +265,12 @@ def run_job(action, recipe, dest, target, on_progress=None, *, prepared=None, de
                 check_canceled()
                 return Result("Source error", local, detail=error_detail(exc))
         try:
-            result = run_release(action, root, recipe, release, target, on_progress, defer_download=defer_download)
+            result = run_release(action, root, recipe, release, target, on_progress, defer_download=defer_download,
+                                 previous_versions=previous_versions, update_app_path=update_app_path)
             if isinstance(result, Release):
                 pending = read_state(root, "pending.json")
                 generations = tuple(entry["release"] if entry else None for entry in (state, pending))
-                return PreparedDownload(recipe, dest, target, release, generations)
+                return PreparedDownload(recipe, dest, target, release, generations, previous_versions)
             return result
         except ERRORS as exc:
             return Result("Error", local, release.version, error_detail(exc))
@@ -230,7 +300,13 @@ def main(argv=None):
     parser.add_argument("--targets", type=Path, help="machine-local output paths (default: DEST/targets.json)")
     args = parser.parse_args(argv)
     dest = (args.dest or default_destination()).resolve()
-    targets = load_targets(args.targets or dest / "targets.json", dest)
+    targets_path = args.targets or dest / "targets.json"
+    targets = load_targets(targets_path, dest)
+    app_folder = read_destination(app_folder_preference_path()) if args.dest is None else None
+    previous_versions = (read_previous_versions(previous_versions_preference_path())
+                         if args.dest is None else DEFAULT_PREVIOUS_VERSIONS)
+    if app_folder is not None:
+        app_folder = validate_app_folder(app_folder.resolve(), dest)
     paths = sorted(args.recipes.glob("*.json")) if args.all else [args.recipe]
     if not paths:
         raise ValueError(f"No JSON recipes in {args.recipes}")
@@ -244,7 +320,8 @@ def main(argv=None):
     def process(item):
         _, job = item
         delays = UPDATE_RETRY_DELAYS if args.all and args.action == "fetch" else ()
-        return execute(args.action, job, dest, targets, retry_delays=delays)
+        return execute(args.action, job, dest, targets, retry_delays=delays, app_folder=app_folder,
+                       targets_path=targets_path, previous_versions=previous_versions)
 
     github_pause_announced = False
 
@@ -303,6 +380,7 @@ class PreparedDownload:
     target: Path | None
     release: Release
     generations: tuple
+    previous_versions: int = 0
     retry_delays: tuple = ()
 
     def can_reuse_release(self, root, current):
@@ -313,11 +391,12 @@ class PreparedDownload:
                 return False
         return True
 
-    def run(self, on_progress=None, *, cancel_event=None, on_retry=None):
+    def run(self, on_progress=None, *, cancel_event=None, on_retry=None, update_app_path=None):
         try:
             with cancel_scope(cancel_event):
                 return fetch_with_retries(self.job, self.dest, self.target, on_progress, cancel_event,
-                                          self.retry_delays, prepared=self, on_retry=on_retry)
+                                          self.retry_delays, prepared=self, on_retry=on_retry,
+                                          previous_versions=self.previous_versions, update_app_path=update_app_path)
         except JobCanceled:
             return Result("Canceled")
         except ERRORS as exc:
@@ -325,11 +404,12 @@ class PreparedDownload:
 
 
 def fetch_with_retries(job, dest, target, on_progress, cancel_event, delays, *,
-                       prepared=None, defer_download=False, on_retry=None):
+                       prepared=None, defer_download=False, on_retry=None, previous_versions=0, update_app_path=None):
     while True:
         check_canceled()
         try:
-            result = run_job("fetch", job, dest, target, on_progress, prepared=prepared, defer_download=defer_download)
+            result = run_job("fetch", job, dest, target, on_progress, prepared=prepared, defer_download=defer_download,
+                             previous_versions=previous_versions, update_app_path=update_app_path)
         except ERRORS as exc:
             result = Result("Error", detail=error_detail(exc))
         if isinstance(result, PreparedDownload):
@@ -347,14 +427,17 @@ def fetch_with_retries(job, dest, target, on_progress, cancel_event, delays, *,
         prepared = None
 
 
-def prepare_fetch(job, dest, targets, *, cancel_event=None, retry_delays=(), on_retry=None):
+def prepare_fetch(job, dest, targets, *, cancel_event=None, retry_delays=(), on_retry=None,
+                  app_folder=None, targets_path=None, previous_versions=0, update_app_path=None):
     """Complete local work now, or queue the resolved release for a network download."""
     return execute("fetch", job, dest, targets, cancel_event=cancel_event,
-                   defer_download=True, retry_delays=retry_delays, on_retry=on_retry)
+                   defer_download=True, retry_delays=retry_delays, on_retry=on_retry, app_folder=app_folder,
+                   targets_path=targets_path, previous_versions=previous_versions, update_app_path=update_app_path)
 
 
 def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *,
-            defer_download=False, retry_delays=(), on_retry=None):
+            defer_download=False, retry_delays=(), on_retry=None, app_folder=None, targets_path=None,
+            previous_versions=0, update_app_path=None):
     try:
         with cancel_scope(cancel_event):
             if isinstance(job, Result):
@@ -365,16 +448,13 @@ def execute(action, job, dest, targets, on_progress=None, cancel_event=None, *,
                 return local_result(job)
             if action in ("check", "fetch", "resume") and job.updates_disabled:
                 return Result("Disabled")
-            keys = [key for key in job.id_keys() if key in targets]
-            if len(keys) > 1:
-                raise ValueError(message("Multiple target mappings for {app}: {keys}. "
-                                         "Keep one mapping for this item in the targets file.",
-                                         app=job.id, keys=", ".join(keys)))
-            target = targets[keys[0]] if keys else None
+            target = target_for_job(job, targets, dest, app_folder, targets_path)
             if action == "fetch":
                 return fetch_with_retries(job, dest, target, on_progress, cancel_event, retry_delays,
-                                          defer_download=defer_download, on_retry=on_retry)
-            return run_job(action, job, dest, target, on_progress)
+                                          defer_download=defer_download, on_retry=on_retry,
+                                          previous_versions=previous_versions, update_app_path=update_app_path)
+            return run_job(action, job, dest, target, on_progress, previous_versions=previous_versions,
+                           update_app_path=update_app_path)
     except JobCanceled:
         return Result("Canceled")
     except ERRORS as exc:

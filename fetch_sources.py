@@ -672,12 +672,10 @@ def response_chunks(response):
     yield from read_chunks(response)
 
 
-def extract_windows_archive(recipe, release, archive, destination):
+def extract_windows_archive(archive, destination, *, prefix="", members=None):
     """Read the Windows tar stream and create only validated directories and regular files."""
     tar = Path(os.environ["SystemRoot"]) / "System32" / "tar.exe"
-    prefix = release.source_folder or (recipe.extract_folder.replace("{version}", release.version)
-                                      .replace("{asset}", release.asset))
-    if prefix and recipe.extract_folder != ".":
+    if prefix:
         filename(prefix)
     destination.mkdir()
     found = set()
@@ -690,14 +688,17 @@ def extract_windows_archive(recipe, release, archive, destination):
             with tarfile.open(fileobj=process.stdout, mode="r|") as stream:
                 for entry in stream:
                     check_canceled()
-                    parts = entry.name.split("/")
-                    if prefix and recipe.extract_folder != ".":
+                    name = entry.name.removeprefix("./") if members is None and not prefix else entry.name
+                    if name in ("", ".") and entry.isdir() and members is None and not prefix:
+                        continue
+                    parts = name.split("/")
+                    if prefix:
                         if parts[0] != prefix:
                             continue
                         parts = parts[1:]
                         if not parts and entry.isdir():
                             continue
-                    elif not recipe.extract_folder and entry.name not in recipe.extract:
+                    elif members is not None and name not in members:
                         continue
                     path = destination.joinpath(*(filename(part) for part in parts))
                     if not parts or path == destination or path in found:
@@ -724,9 +725,6 @@ def extract_windows_archive(recipe, release, archive, destination):
             if process.poll() is None:
                 process.kill()
             process.stdout.close()
-    for name in recipe.extract:
-        if not (destination / name).is_file():
-            raise ValueError(f"Missing archive member: {name}")
 
 
 def stage_release(recipe, release, folder, on_progress=None):
@@ -743,7 +741,14 @@ def stage_release(recipe, release, folder, on_progress=None):
     if release.checksum and archive_checksum != release.checksum:
         raise ValueError(message("Publisher SHA-256 mismatch for {file}", file=release.archive))
     if recipe.extract_folder or (recipe.extract and archive.suffix.lower() != ".zip" and not zipfile.is_zipfile(archive)):
-        extract_windows_archive(recipe, release, archive, folder / "files")
+        prefix = "" if recipe.extract_folder == "." else release.source_folder or (
+            recipe.extract_folder.replace("{version}", release.version).replace("{asset}", release.asset))
+        extracted = folder / "files"
+        extract_windows_archive(archive, extracted, prefix=prefix,
+                                members=None if recipe.extract_folder else recipe.extract)
+        for name in recipe.extract:
+            if not (extracted / name).is_file():
+                raise ValueError(f"Missing archive member: {name}")
     elif recipe.extract or archive.suffix.lower() == ".zip":
         with zipfile.ZipFile(archive) as package:
             if not recipe.extract:

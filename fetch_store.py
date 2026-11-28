@@ -18,17 +18,27 @@ from pathlib import Path
 from fetch_sources import digest, filename, stage_release, windows_product_version
 from shelf_cancel import JobCanceled, cancel_scope, check_canceled, read_chunks
 from shelf_message import error_detail, message
+from shelf_running_app import app_is_running, request_app_close
 from shelf_shortcuts import shortcut_path, write_shortcut
 
 
 ISO_VERSION = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._+-]*")
 WAITING_FOR_CLOSE = "Waiting for the app to close"
+FILES_IN_USE = "Files in use"
 DOWNGRADE_SKIPPED = "Downgrade skipped"
 SHARING_ERRORS = {32, 33}
 
 
 def is_versioned_iso_target(path):
     return path is not None and path.suffix.lower() == ".iso" and path.stem.endswith(" {version}")
+
+
+def is_folder_target(path):
+    return path is not None and path.name == "{filename}"
+
+
+def previous_app_folder(root, live):
+    return root / ".previous-app" if live.parent == root else live.with_name(f".{live.name}.relf-previous")
 
 
 def target_for_version(path, version):
@@ -49,6 +59,11 @@ def read_state(root, name):
     if (not isinstance(state, dict) or not isinstance(state.get("version"), str)
             or not isinstance(state.get("sha256"), dict)
             or not re.fullmatch(r"[0-9a-f]{32}", str(state.get("release", "")))):
+        raise ValueError(message("Invalid release manifest: {path}", path=path))
+    history = state.get("history", [])
+    if not isinstance(history, list) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("version"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", str(entry.get("release", ""))) for entry in history):
         raise ValueError(message("Invalid release manifest: {path}", path=path))
     return state
 
@@ -164,13 +179,20 @@ def prune_legacy_archive(root, folder, recipe, output):
         old.unlink()
 
 
-def prune_releases(root, recipe, output, current, pending=None):
-    """Called under the fetch lock. Keep both sides of an unfinished publication."""
+def prune_releases(root, recipe, output, current, pending=None, *, previous_versions=0):
+    """Called under the fetch lock. Keep history and unfinished publications."""
     check_link(root)
     releases = root / "releases"
     check_link(releases)
-    keep = {entry["release"] for entry in (current, pending) if entry}
-    for folder in releases.iterdir():
+    keep = {entry["release"] for entry in (current, pending) if entry} if pending else set()
+    if current:
+        history = current.get("history", [])
+        if not pending and len(history) > previous_versions:
+            history = history[:previous_versions]
+            current["history"] = history
+            write_state(root / "current.json", current)
+        keep.update(entry["release"] for entry in history)
+    for folder in releases.iterdir() if releases.exists() else ():
         if folder.name in keep or not re.fullmatch(r"[0-9a-f]{32}", folder.name):
             continue
         check_link(folder)
@@ -178,10 +200,14 @@ def prune_releases(root, recipe, output, current, pending=None):
             if not pending:
                 prune_legacy_archive(root, folder, recipe, output)
             shutil.rmtree(folder, onexc=retry_readonly_removal)
-    previous = root / ".previous-app"
-    if current and not pending and previous.exists():
-        check_link(previous)
-        shutil.rmtree(previous, onexc=retry_readonly_removal)
+    if current and not pending:
+        backups = {root / ".previous-app"}
+        if output.tree:
+            backups.add(previous_app_folder(root, output.path.parent))
+        for previous in backups:
+            check_link(previous)
+            if previous.exists():
+                shutil.rmtree(previous, onexc=retry_readonly_removal)
 
 
 def remove_superseded_output(root, previous, output):
@@ -189,8 +215,10 @@ def remove_superseded_output(root, previous, output):
     path = Path(published.get("path", ""))
     if path == output.path or not published:
         return
-    versioned_iso = output.template and path == target_for_version(output.template, previous["version"])
-    if not versioned_iso and path.parent not in (root / "current", root / "bin"):
+    versioned_iso = is_versioned_iso_target(output.template) and path == target_for_version(
+        output.template, previous["version"])
+    same_mapped_folder = is_folder_target(output.template) and path.parent == output.path.parent
+    if not (versioned_iso or same_mapped_folder or path.parent in (root / "current", root / "bin")):
         return
     if path.parent == output.path.parent and (output.tree or Path(path.name) in output.companions):
         return
@@ -307,20 +335,25 @@ class Output:
         published = (state or {}).get("published", {})
         if recipe.publish_exe and Path(published.get("path", "")) != default:
             default = root / "bin" / recipe.publish_exe
-        if recipe.extract_folder and override:
+        folder_target = is_folder_target(override)
+        if recipe.extract_folder and override and not folder_target:
             raise ValueError("A file target cannot publish a complete folder. Remove this item's file mapping.")
-        template = override if is_versioned_iso_target(override) else None
-        if template and (recipe.extract or Path(archive).suffix.lower() != ".iso"):
+        versioned_iso = is_versioned_iso_target(override)
+        if versioned_iso and (recipe.extract or Path(archive).suffix.lower() != ".iso"):
             raise ValueError("A versioned ISO target requires an ISO download without extraction.")
-        target = target_for_version(override, version) or default
-        if template:
+        if folder_target:
+            target = override.with_name(Path(member).name)
+            check_link(target.parent)
+        else:
+            target = target_for_version(override, version) or default
+        if versioned_iso or folder_target:
             check_link(target)
-        tree = bool(recipe.extract_folder or (len(recipe.extract) > 1 and override is None))
+        tree = bool(recipe.extract_folder or (len(recipe.extract) > 1 and (override is None or folder_target)))
         files = companion_files(recipe.companion_dir, target)
         settings = frozenset(portable_settings(recipe, files))
         return cls(member, target, tree,
                    shortcut_path(recipe.shortcut) if recipe.shortcut else None,
-                   files, settings, recipe.apply_custom_settings, template)
+                   files, settings, recipe.apply_custom_settings, override if versioned_iso or folder_target else None)
 
     def companion_issue(self, state):
         for relative, source in self.companions.items():
@@ -397,16 +430,32 @@ def saved_version_is_newer(recipe, state, offered):
             and version_is_newer(state["version"], offered))
 
 
-def installed_versions(target, candidate):
-    if os.name != "nt" or target.suffix.lower() not in {".exe", ".dll", ".scr", ".cpl", ".ocx"} or not target.is_file():
+def executable_version(path):
+    if os.name != "nt" or path.suffix.lower() not in {".exe", ".dll", ".scr", ".cpl", ".ocx"} or not path.is_file():
         return None
     try:
-        installed = windows_product_version(target, fixed_fallback=True)
-        offered = windows_product_version(candidate, fixed_fallback=True)
+        return windows_product_version(path, fixed_fallback=True)
     except (OSError, ValueError):
         return None
-    if version_is_newer(installed, offered):
+
+
+def installed_versions(target, candidate, saved_version=None):
+    installed = executable_version(target)
+    if installed and (offered := saved_version or executable_version(candidate)) and version_is_newer(installed, offered):
         return installed, offered
+
+
+def versions_against_publication(root, output, state):
+    return installed_versions(output.path, root / "releases" / state["release"] / output.member,
+                              state.get("published", {}).get("file_version"))
+
+
+def remember_published_file_version(root, output, state):
+    published = state["published"]
+    if "member" not in published or "file_version" not in published:
+        published["member"] = output.member
+        published["file_version"] = executable_version(output.path)
+        write_state(root / "current.json", state)
 
 
 class DowngradeSkipped(Exception):
@@ -507,7 +556,7 @@ def publication_lock(error, output):
 def publish_tree(root, folder, state, output):
     """Switch the staged app into place, preserving files the user or app added."""
     live = output.path.parent
-    previous = root / ".previous-app"
+    previous = previous_app_folder(root, live)
     if any(path.is_symlink() or path.is_junction() for path in (live, previous)):
         raise ValueError("Unexpected link at the item directory")
     if previous.exists() and not live.exists():
@@ -515,8 +564,9 @@ def publish_tree(root, folder, state, output):
     names = list(tree_members(state))
     old_state = read_state(root, "current.json") or {"sha256": {}}
     old_published = old_state.get("published", {})
-    old_files = {Path(name[6:]) for name in tree_members(old_state) if name in old_published.get("stats", {})}
+    old_files = set()
     if old_published.get("path") and Path(old_published["path"]).parent == live:
+        old_files = {Path(name[6:]) for name in tree_members(old_state) if name in old_published.get("stats", {})}
         old_files.add(Path(Path(old_published["path"]).name))
     managed = [name for name in names if Path(name[6:]) not in output.companions]
     obsolete = old_files.difference((Path(name[6:]) for name in names), output.companions)
@@ -531,7 +581,8 @@ def publish_tree(root, folder, state, output):
     for path in old_files:
         if path.suffix.lower() in {".exe", ".dll"} and file_in_use(live / path):
             raise PermissionError(13, "File is in use", str(live / path), 32)
-    with tempfile.TemporaryDirectory(dir=root, prefix=".publish-") as staging:
+    live.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=live.parent, prefix=".publish-") as staging:
         ready = Path(staging) / "app"
         shutil.copytree(folder / "files", ready)
         for name in names:
@@ -581,7 +632,41 @@ def publish_tree(root, folder, state, output):
     return {name: stamp(live / name[6:]) for name in managed}
 
 
-def publish(root, recipe, state, output, archive, previous):
+def archive_previous(root, recipe, previous):
+    """Save the old working release before replacing it, using its recorded checksums."""
+    releases = root / "releases"
+    folder = releases / previous["release"]
+    check_link(folder)
+    if folder.exists():
+        return
+    published = previous.get("published", {})
+    primary = Path(published.get("path", ""))
+    if not primary.is_absolute() or not primary.is_file():
+        return
+    member = published.get("member")
+    if member is None:
+        archive = filename(previous.get("archive", recipe.archive))
+        member = recipe.versioned_members(previous["version"]).primary(archive)
+    paths = {name: primary.parent / name[6:] for name in tree_members(previous)
+             if name in published.get("stats", {})}
+    paths[member] = primary
+    with tempfile.TemporaryDirectory(dir=releases, prefix=".history-") as temp:
+        snapshot = Path(temp) / "release"
+        for name, source in paths.items():
+            for part in (*reversed(source.parents), source):
+                check_link(part)
+            checksum = previous["sha256"].get(name)
+            if not checksum or not source.is_file():
+                return
+            copy = snapshot.joinpath(*(filename(part) for part in name.split("/")))
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, copy)
+            if digest(copy) != checksum:
+                return
+        snapshot.rename(folder)
+
+
+def publish(root, recipe, state, output, archive, previous, previous_versions):
     folder = root / "releases" / state["release"]
     state["archive"] = archive
     state.pop("publication_lock", None)
@@ -611,6 +696,8 @@ def publish(root, recipe, state, output, archive, previous):
             protect_installed_version(target, source)
         write_state(root / "pending.json", state)
         with cancel_scope(None):
+            if previous_versions and previous and previous["version"] != state["version"]:
+                archive_previous(root, recipe, previous)
             if output.tree:
                 stats = publish_tree(root, folder, state, output)
             else:
@@ -618,7 +705,8 @@ def publish(root, recipe, state, output, archive, previous):
                 if temp is not None:
                     protect_installed_version(target, source)
                     os.replace(temp, target)
-            state["published"] = {"path": str(target), "stat": stamp(target)}
+            state["published"] = {"path": str(target), "stat": stamp(target), "member": output.member,
+                                  "file_version": executable_version(target)}
             if output.tree:
                 state["published"]["stats"] = stats
                 if output.companions:
@@ -643,8 +731,38 @@ def publish(root, recipe, state, output, archive, previous):
     finally:
         if temp is not None:
             temp.unlink(missing_ok=True)
+    history = []
+    if previous and previous_versions:
+        versions = {state["version"]}
+        for entry in (previous, *previous.get("history", [])):
+            if entry["version"] not in versions and (root / "releases" / entry["release"]).is_dir():
+                history.append({"version": entry["version"], "release": entry["release"]})
+                versions.add(entry["version"])
+                if len(history) == previous_versions:
+                    break
+    if history:
+        state["history"] = history
+    else:
+        state.pop("history", None)
+    state.pop("app_update", None)
     write_state(root / "current.json", state)
     (root / "pending.json").unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class AppUpdate:
+    app: Path
+    package: Path
+
+
+def saved_app_update(state):
+    data = state.get("app_update")
+    if isinstance(data, dict):
+        app, package = (data.get(key) for key in ("app", "package"))
+        if all(isinstance(value, str) and "\x00" not in value and Path(value).is_absolute()
+               for value in (app, package)) and Path(app).suffix.lower() == ".exe":
+            return AppUpdate(Path(app), Path(package))
+    return None
 
 
 @dataclass
@@ -654,23 +772,33 @@ class Result:
     available: str = "-"
     detail: str = ""
     locked_path: Path | None = None
+    app_update: AppUpdate | None = None
+    waiting_for_close: bool = False
 
     @property
     def display_status(self):
-        return WAITING_FOR_CLOSE if self.locked_path is not None else self.status
+        if self.waiting_for_close:
+            return WAITING_FOR_CLOSE
+        return FILES_IN_USE if self.locked_path is not None else self.status
 
 
 def pending_result(pending, local, detail):
+    update = saved_app_update(pending)
+    waiting = update is not None and app_is_running(update.app)
+    locked = None
     lock = pending.get("publication_lock")
     if isinstance(lock, dict) and isinstance(lock.get("path"), str) and isinstance(lock.get("target"), str):
         path = Path(lock["path"])
         if path.is_absolute() and "\x00" not in lock["path"]:
-            return Result("Pending", local, pending["version"],
-                          message("Publication pending: {path}", path=lock["target"]), path)
-    return Result("Pending", local, pending["version"], detail)
+            locked = path
+            detail = message("Publication pending: {path}", path=lock["target"])
+    if waiting:
+        detail = message("Waiting for the app to close")
+    return Result("Pending", local, pending["version"], detail, locked, update, waiting)
 
 
-def run_release(action, root, recipe, release, override, on_progress=None, *, defer_download=False):
+def run_release(action, root, recipe, release, override, on_progress=None, *,
+                defer_download=False, previous_versions=0, update_app_path=None):
     """Return the resolved release if a network transfer is required and deferred."""
     state = read_state(root, "current.json")
     pending = read_state(root, "pending.json")
@@ -682,14 +810,16 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     output = Output.for_release(root, recipe.versioned_members(release.version), release.archive, override,
                                 state or pending, release.version)
     same = matches(state, recipe, release)
-    cached_issue = cache_issue(root, recipe, state, release.archive, action == "fetch") if same else None
-    issue = cached_issue or ""
-    if same and not issue:
+    issue = ""
+    if same:
         issue = output.issue(state, action == "fetch")
         if not issue and pending is None:
             if action == "fetch":
-                prune_releases(root, recipe, output, state)
+                remember_published_file_version(root, output, state)
+                prune_releases(root, recipe, output, state, previous_versions=previous_versions)
             return Result("Latest", local, release.version, str(output.path))
+        if issue and (versions := versions_against_publication(root, output, state)):
+            return downgrade_result(*versions, release.version)
 
     if not state:
         reason = message("Missing manifest: {path}", path=root / "current.json")
@@ -698,22 +828,14 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     else:
         reason = issue or message("Recipe or release asset changed")
     if action == "check":
-        if issue and same and not cached_issue:
-            source = root / "releases" / state["release"] / output.member
-            if versions := installed_versions(output.path, source):
-                return downgrade_result(*versions, release.version)
         if matches(pending, recipe, release):
             return pending_result(pending, local, message("Publication pending: {path}", path=output.path))
         return Result("Repair needed" if same else "Update available", local, release.version, reason)
 
     candidate = None
-    if matches(pending, recipe, release):
-        pending_issue = (cached_issue if same and pending["release"] == state["release"]
-                         and pending["sha256"] == state["sha256"]
-                         else cache_issue(root, recipe, pending, release.archive, True))
-        if not pending_issue:
-            candidate = pending.copy()
-    if candidate is None and same and not cached_issue:
+    if matches(pending, recipe, release) and not cache_issue(root, recipe, pending, release.archive, True):
+        candidate = pending.copy()
+    if candidate is None and same and not cache_issue(root, recipe, state, release.archive, True):
         candidate = state.copy()
     if candidate is None:
         if defer_download:
@@ -723,12 +845,31 @@ def run_release(action, root, recipe, release, override, on_progress=None, *, de
     else:
         status = "Cached"
     detail = message("Fetch needed: {reason}\n{path}", reason=reason, path=output.path)
-    return publish_release(root, recipe, candidate, output, release.archive, state, status, detail)
+    return publish_release(root, recipe, candidate, output, release.archive, state, status, detail,
+                           previous_versions, update_app_path=update_app_path, request_close=not same)
 
 
-def publish_release(root, recipe, candidate, output, archive, state, status, detail):
+def publish_release(root, recipe, candidate, output, archive, state, status, detail, previous_versions, *,
+                    update_app_path=None, request_close=False):
+    local = state["version"] if state else "-"
+    old_path = Path((state or {}).get("published", {}).get("path", ""))
+    update = saved_app_update(candidate)
+    app = update_app_path(recipe, output.path, old_path) if update_app_path and (update or request_close) else None
+    if update and (update.package != output.path or (update_app_path and update.app != app)):
+        candidate.pop("app_update", None)
+        update = None
     try:
-        publish(root, recipe, candidate, output, archive, state)
+        if update and app_is_running(update.app):
+            return pending_result(candidate, local, detail)
+        if not update and request_close and app is not None and app.is_file():
+            check_canceled()
+            with cancel_scope(None):
+                if request_app_close(app):
+                    candidate["app_update"] = {"app": str(app), "package": str(output.path)}
+                    candidate.pop("publication_lock", None)
+                    write_state(root / "pending.json", candidate)
+                    return pending_result(candidate, local, detail)
+        publish(root, recipe, candidate, output, archive, state, previous_versions)
     except JobCanceled:
         if status == "Updated":
             shutil.rmtree(root / "releases" / candidate["release"])
@@ -740,11 +881,14 @@ def publish_release(root, recipe, candidate, output, archive, state, status, det
         prune_releases(root, recipe, output, state, candidate)
         return pending_result(candidate, state["version"] if state else "-", error_detail(exc))
     with cancel_scope(None):
-        prune_releases(root, recipe, output, candidate)
-    return Result(status, candidate["version"], candidate["version"], detail)
+        prune_releases(root, recipe, output, candidate, previous_versions=previous_versions)
+    if update and app is not None and not recipe.running_exe and app == old_path and output.path.suffix.lower() == ".exe":
+        update = AppUpdate(output.path, output.path)
+    return Result(status, candidate["version"], candidate["version"], detail,
+                  app_update=update if app is not None else None)
 
 
-def resume_publication(root, recipe, override):
+def resume_publication(root, recipe, override, *, previous_versions=0, update_app_path=None):
     with fetch_lock(root):
         state = read_state(root, "current.json")
         pending = read_state(root, "pending.json")
@@ -752,7 +896,8 @@ def resume_publication(root, recipe, override):
         if not pending:
             return Result("Latest" if state else "Unknown", local)
         result = pending_result(pending, local, "Run Get updates to retry publication.")
-        if result.locked_path is None or file_in_use(result.locked_path):
+        if (result.waiting_for_close or (result.locked_path is not None and file_in_use(result.locked_path))
+                or (result.locked_path is None and result.app_update is None)):
             return result
         if not recipe.matches_fingerprint(pending.get("recipe")):
             return Result("Repair needed", local, detail="Recipe differs from the saved release")
@@ -762,12 +907,14 @@ def resume_publication(root, recipe, override):
             discard_downgrade(root, pending, state)
             return downgrade_result(local, version, version)
         output = Output.for_release(root, recipe.versioned_members(version), archive, override, state or pending, version)
-        if output.path != Path(pending["publication_lock"]["target"]):
+        target = result.app_update.package if result.app_update else Path(pending["publication_lock"]["target"])
+        if output.path != target:
             return Result("Repair needed", local,
                           detail=message("Publish the verified file to {path}", path=output.path))
         if issue := cache_issue(root, recipe, pending, archive, True):
             return Result("Repair needed", local, version, issue)
-        return publish_release(root, recipe, pending, output, archive, state, "Cached", str(output.path))
+        return publish_release(root, recipe, pending, output, archive, state, "Cached", str(output.path),
+                               previous_versions, update_app_path=update_app_path)
 
 
 def verify(root, recipe, override):
@@ -779,16 +926,14 @@ def verify(root, recipe, override):
     local = state["version"]
     if not recipe.matches_fingerprint(state.get("recipe")):
         return Result("Repair needed", local, detail="Recipe differs from the saved release")
+    if pending and saved_app_update(pending):
+        return pending_result(pending, local, "Publication pending. Run fetch to finish.")
     archive = filename(state.get("archive", recipe.archive))
     output = Output.for_release(root, recipe.versioned_members(local), archive, override, state, local)
-    issue = cache_issue(root, recipe, state, archive, True)
-    if not issue:
-        issue = output.issue(state, True)
-        if issue:
-            source = root / "releases" / state["release"] / output.member
-            if versions := installed_versions(output.path, source):
-                return downgrade_result(*versions, local)
+    issue = output.issue(state, True)
     if issue:
+        if versions := versions_against_publication(root, output, state):
+            return downgrade_result(*versions, local)
         return Result("Repair needed", local, detail=issue)
     if pending:
         return pending_result(pending, local, "Publication pending. Run fetch to finish.")

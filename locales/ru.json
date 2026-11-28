@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "Здесь отображаются элементы с ошибками источника, файлов или публикации.",
   "Unknown": "Неизвестно",
   "Pending": "Ожидает",
+  "Files in use": "Файлы заняты",
   "Waiting for the app to close": "Ожидание закрытия приложения",
   "Downgrade skipped": "Понижение версии пропущено",
   "Kept version {installed} because {offered} is older.": "Версия {installed} сохранена, поскольку {offered} — более ранняя версия.",

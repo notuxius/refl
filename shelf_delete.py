@@ -9,8 +9,9 @@ import re
 import shutil
 
 from fetch_sources import Recipe, filename
-from fetch_store import check_link, fetch_lock, read_state, retry_readonly_removal, target_for_version
-from releaseshelf import APP_DIR, load_targets, read_jobs
+from fetch_store import (check_link, fetch_lock, is_folder_target, previous_app_folder, read_state,
+                         retry_readonly_removal, target_for_version)
+from releaseshelf import APP_DIR, load_targets, read_jobs, target_for_job
 from shelf_checklist import LocalItem
 
 
@@ -32,7 +33,7 @@ def check_location(path):
         check_link(part)
 
 
-def deletion_plan(mode, path, job, dest, targets):
+def deletion_plan(mode, path, job, dest, targets, *, app_folder=None):
     if mode == DELETE:
         return Deletion()
     if mode != FOLDER:
@@ -78,8 +79,14 @@ def deletion_plan(mode, path, job, dest, targets):
             managed = primary.parent in (root / "current", root / "bin")
             if not managed:
                 mappings = load_targets(targets, dest)
-                if not any(target_for_version(mappings.get(key), state["version"]) == primary for key in job.id_keys()):
+                mapped = target_for_job(job, mappings, dest, app_folder, targets)
+                folder_mapped = is_folder_target(mapped) and mapped.parent == primary.parent
+                if not folder_mapped and target_for_version(mapped, state["version"]) != primary:
                     raise ValueError(f"Published path no longer matches the item's target mapping: {primary}")
+                if folder_mapped:
+                    backup = previous_app_folder(root, primary.parent)
+                    if backup.is_dir():
+                        folders.add(backup)
             app_folders.add(primary.parent)
         if (root / ".previous-app").is_dir():
             folders.add(root / ".previous-app")
@@ -102,7 +109,7 @@ def deletion_plan(mode, path, job, dest, targets):
     return Deletion(tuple(sorted(folders)), tuple(manifests), cache)
 
 
-def delete_item(mode, path, job, original, plan, dest, targets):
+def delete_item(mode, path, job, original, plan, dest, targets, *, app_folder=None):
     """Delete the recipe last so locked files and partial cleanup can be retried."""
     with fetch_lock(path.parent):
         check_link(path)
@@ -112,7 +119,7 @@ def delete_item(mode, path, job, original, plan, dest, targets):
         if plan.cache:
             check_location(plan.cache / ".fetch.lock")
         with fetch_lock(plan.cache) if plan.cache else nullcontext():
-            if deletion_plan(mode, path, job, dest, targets) != plan:
+            if deletion_plan(mode, path, job, dest, targets, app_folder=app_folder) != plan:
                 raise ValueError("Reload the app list and try again.")
             for folder in plan.folders:
                 shutil.rmtree(folder, onexc=retry_readonly_removal)

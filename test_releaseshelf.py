@@ -26,7 +26,7 @@ import zipfile
 
 from fetch_sources import Recipe, copy_with_progress, open_url, windows_product_version
 from fetch_store import DOWNGRADE_SKIPPED, Result, digest, version_is_newer, write_state
-from releaseshelf import batch_map, default_destination, execute
+from releaseshelf import batch_map, default_destination, execute, prepare_fetch
 from shelf_cancel import cancel_scope, publisher_items
 from shelf_theme import preference_path
 
@@ -198,6 +198,18 @@ class RelfTest(unittest.TestCase):
         headers["Content-Length"] = str(len(data))
         headers["Last-Modified"] = "Tue, 10 Nov 2026 16:20:57 GMT"
         return addinfourl(io.BytesIO(data), headers, request.full_url, 200)
+
+    def seed_legacy_current_cache(self, state):
+        folder = self.job / "releases" / state["release"]
+        folder.mkdir(parents=True)
+        (folder / state["archive"]).write_bytes(self.archive.read_bytes())
+        with zipfile.ZipFile(self.archive) as package:
+            for name in state["sha256"]:
+                if name.startswith("files/"):
+                    path = folder / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(package.read(name[6:]))
+        return folder
 
     def test_local_catalog_item_is_offline_and_skipped_in_batches(self):
         folder = self.recipe_file.parent / "catalog"
@@ -496,6 +508,97 @@ class RelfTest(unittest.TestCase):
             self.assertEqual((self.job / "current" / f"Tool {version}.exe").read_text(), version)
         self.assertFalse((self.job / "current" / "Tool 1.27.exe").exists())
 
+    @unittest.skipUnless(os.name == "nt", "Uses Windows tar")
+    def test_full_folder_publishes_to_a_dedicated_target_outside_the_cache(self):
+        self.recipe.update(extract_folder=".", extract=["Tool {version}.exe"])
+        self.recipe_file.write_text(json.dumps(self.recipe))
+        live = self.dest.parent / "Software" / "Sample Tool"
+        self.dest.mkdir()
+        mappings = self.dest / "targets.json"
+        target = str(live / "{filename}")
+        mappings.write_text(json.dumps({self.recipe["id"]: target, "another": str(live / "app.exe")}))
+        self.assertIn("dedicated app folder", self.cli("fetch", success=False))
+        mappings.write_text(json.dumps({self.recipe["id"]: target}))
+        for version in ("1.27", "1.28"):
+            with self.subTest(version=version):
+                self.page.write_text(f"SampleTool v{version}")
+                with zipfile.ZipFile(self.archive, "w") as package:
+                    package.writestr(f"Tool {version}.exe", version)
+                    package.writestr("settings/default.ini", version)
+                self.assertIn("Updated", self.cli("fetch"))
+                self.assertIn(f"SHA-256 verified: {live / f'Tool {version}.exe'}", self.cli("verify"))
+                self.assertEqual((live / "settings/default.ini").read_text(), version)
+                if version == "1.27":
+                    (live / "user.log").write_text("keep")
+        self.assertEqual((live / "user.log").read_text(), "keep")
+        self.assertFalse((live / "Tool 1.27.exe").exists())
+        self.assertFalse((self.job / "current").exists())
+        self.assertEqual(list(live.parent.iterdir()), [live])
+
+    def test_selected_app_library_keeps_configured_number_of_previous_versions(self):
+        job = Recipe.read(self.recipe_file)
+        library = self.dest.parent / "Software"
+        live = library / job.id / self.recipe["extract"][0]
+        releases = self.job / "releases"
+        with patch("urllib.request.OpenerDirector.open", side_effect=self.reply):
+            for version in ("1.27", "1.28", "1.29", "1.30"):
+                self.page.write_text(f"SampleTool v{version}")
+                with zipfile.ZipFile(self.archive, "w") as package:
+                    for name in self.recipe["extract"]:
+                        package.writestr(name, version)
+                prepared = prepare_fetch(job, self.dest, {}, app_folder=library, previous_versions=2)
+                result = prepared.run()
+                self.assertEqual(result.status, "Updated", result.detail)
+                self.assertEqual(live.read_text(), version)
+            state = json.loads(self.manifest.read_text())
+            history = state["history"]
+            self.assertEqual([entry["version"] for entry in history], ["1.29", "1.28"])
+            self.assertEqual({path.name for path in releases.iterdir()},
+                             {entry["release"] for entry in history})
+            for entry in history:
+                for member in self.recipe["extract"]:
+                    self.assertEqual((releases / entry["release"] / "files" / member).read_text(), entry["version"])
+            self.assertFalse((releases / state["release"]).exists())
+            self.assertEqual(execute("verify", job, self.dest, {}, app_folder=library).status, "Verified")
+            self.assertEqual(execute("fetch", job, self.dest, {}, app_folder=library, previous_versions=1).status,
+                             "Latest")
+            self.assertEqual({path.name for path in releases.iterdir()}, {history[0]["release"]})
+            self.assertEqual(json.loads(self.manifest.read_text())["history"], history[:1])
+            self.assertEqual(execute("fetch", job, self.dest, {}, app_folder=library, previous_versions=0).status,
+                             "Latest")
+            self.assertEqual(list(releases.iterdir()), [])
+        self.assertFalse((self.job / "current").exists())
+
+    def test_zero_retention_clears_downloads_only_after_publication(self):
+        job = Recipe.read(self.recipe_file)
+        library = self.dest.parent / "My Drive" / "Software"
+        live = library / job.id / self.recipe["extract"][0]
+        releases = self.job / "releases"
+        with patch("urllib.request.OpenerDirector.open", side_effect=self.reply):
+            for version in ("1.27", "1.28"):
+                self.page.write_text(f"SampleTool v{version}")
+                self.assertEqual(execute("fetch", job, self.dest, {}, app_folder=library,
+                                         previous_versions=1).status, "Updated")
+            history = json.loads(self.manifest.read_text())["history"]
+            self.page.write_text("SampleTool v1.29")
+            with zipfile.ZipFile(self.archive, "w") as package:
+                for name in self.recipe["extract"]:
+                    package.writestr(name, "1.29")
+            with patch("fetch_store.publish_tree", side_effect=PermissionError("Drive unavailable")):
+                pending = execute("fetch", job, self.dest, {}, app_folder=library, previous_versions=0)
+            self.assertEqual(pending.status, "Pending", pending.detail)
+            self.assertNotEqual(live.read_text(), "1.29")
+            self.assertTrue((releases / history[0]["release"]).is_dir())
+
+            result = execute("fetch", job, self.dest, {}, app_folder=library, previous_versions=0)
+            self.assertEqual(result.status, "Cached", result.detail)
+            self.assertEqual(live.read_text(), "1.29")
+            self.assertEqual(list(releases.iterdir()), [])
+            self.assertEqual(execute("verify", job, self.dest, {}, app_folder=library).status, "Verified")
+            self.assertEqual(execute("fetch", job, self.dest, {}, app_folder=library, previous_versions=0).status,
+                             "Latest")
+            self.assertEqual(self.requests.count("/sample-tool.zip"), 3)
+
     def cli(self, action, *, success=True, batch=None, expected_code=None):
         selection = ["--all", "--catalog", str(batch)] if batch else [str(self.recipe_file)]
         args = [str(PROJECT / "relf.py"), action, *selection, "--dest", str(self.dest)]
@@ -544,7 +647,7 @@ class RelfTest(unittest.TestCase):
             (live / "user.log").write_bytes(b"keep")
             (live / "settings/default.ini").unlink()
             self.assertEqual(run("verify").status, "Repair needed")
-            self.assertEqual(run("fetch").status, "Cached")
+            self.assertEqual(run("fetch").status, "Updated")
             self.assertEqual((live / "settings/default.ini").read_bytes(), b"first")
             link.unlink()
             self.assertEqual(run("check").status, "Repair needed")
@@ -552,7 +655,7 @@ class RelfTest(unittest.TestCase):
                 self.assertEqual(run("fetch").display_status, "Pending")
             self.assertEqual(run("fetch").status, "Cached")
             self.assertTrue(link.is_file())
-            self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
+            self.assertEqual(self.requests.count("/sample-tool.zip"), 3)
             package("1.1", {"tool.exe": b"exe", "settings/default.ini": b"second"})
             self.assertEqual(run("fetch").status, "Updated")
             self.assertFalse((live / "old.txt").exists())
@@ -574,7 +677,7 @@ class RelfTest(unittest.TestCase):
         (seeds / "help.txt").write_text("imported")
         live = self.job / "current"
         self.assertIn("Repair needed", self.cli("verify", success=False))
-        self.assertIn("Cached", self.cli("fetch"))
+        self.assertIn("Updated", self.cli("fetch"))
         self.assertEqual((live / "help.txt").read_text(), "imported")
         (live / "help.txt").write_text("edited by app")
         self.page.write_text("SampleTool v1.28")
@@ -582,7 +685,7 @@ class RelfTest(unittest.TestCase):
         self.assertEqual((live / "help.txt").read_text(), "edited by app")
         self.assertIn("Verified", self.cli("verify"))
         (live / "Settings/profile.ini").unlink()
-        self.assertIn("Cached", self.cli("fetch"))
+        self.assertIn("Updated", self.cli("fetch"))
         self.assertEqual((live / "Settings/profile.ini").read_text(), "portable")
         catalog = Path(self.temp.name) / "moved"
         catalog.mkdir()
@@ -604,11 +707,11 @@ class RelfTest(unittest.TestCase):
         self.assertFalse(config.exists())
         self.recipe["apply_custom_settings"] = True
         self.recipe_file.write_text(json.dumps(self.recipe))
-        self.assertIn("Cached", self.cli("fetch"))
+        self.assertIn("Updated", self.cli("fetch"))
         self.assertEqual(config.read_text(), "seed")
         config.write_text("edited")
         self.assertIn("Apply custom settings", self.cli("verify", success=False))
-        self.assertIn("Cached", self.cli("fetch"))
+        self.assertIn("Updated", self.cli("fetch"))
         self.assertEqual(config.read_text(), "seed")
         self.recipe["apply_custom_settings"] = False
         self.recipe_file.write_text(json.dumps(self.recipe))
@@ -634,11 +737,11 @@ class RelfTest(unittest.TestCase):
         (live / "restore.ps1").write_text("working copy")
         self.recipe["apply_custom_settings"] = True
         self.recipe_file.write_text(json.dumps(self.recipe))
-        self.assertIn("Cached", self.cli("fetch"))
+        self.assertIn("Updated", self.cli("fetch"))
         self.assertEqual((live / "prefs.xml").read_text(), "custom")
         self.assertEqual((live / "restore.ps1").read_text(), "working copy")
         self.assertIn("Verified", self.cli("verify"))
-        self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
 
     def test_fetch_repeat_and_bad_update(self):
         self.assertIn(f"Missing manifest: {self.manifest}", self.cli("check"))
@@ -648,20 +751,21 @@ class RelfTest(unittest.TestCase):
         state = json.loads(saved)
         folder = self.job / "releases" / state["release"]
         original = self.archive.read_bytes()
-        self.assertEqual((folder / self.archive.name).read_bytes(), original)
+        self.assertFalse(folder.exists())
+        live = Path(state["published"]["path"]).parent
         with zipfile.ZipFile(io.BytesIO(original)) as package:
             for name in self.recipe["extract"]:
-                self.assertEqual((folder / "files" / name).read_bytes(), package.read(name))
+                self.assertEqual((live / name).read_bytes(), package.read(name))
         self.assertIn("Latest: 1.27", self.cli("fetch"))
         self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
         self.page.write_text("SampleTool v1.28")
         self.archive.write_bytes(b"incomplete zip")
         self.assertIn("Error:", self.cli("fetch", success=False))
         self.assertEqual(self.manifest.read_bytes(), saved)
-        for name, checksum in state["sha256"].items():
-            self.assertEqual(hashlib.sha256((folder / name).read_bytes()).hexdigest(), checksum)
+        for name in self.recipe["extract"]:
+            self.assertEqual(hashlib.sha256((live / name).read_bytes()).hexdigest(), state["sha256"]["files/" + name])
         self.assertEqual(list(self.job.glob(".stage-*")), [])
-        self.assertEqual(list((self.job / "releases").iterdir()), [folder])
+        self.assertEqual(list((self.job / "releases").iterdir()), [])
 
     def test_fetch_reports_progress_only_for_network_transfer(self):
         job = Recipe.read(self.recipe_file)
@@ -669,12 +773,14 @@ class RelfTest(unittest.TestCase):
         for known_length in (True, False):
             with self.subTest(known_length=known_length):
                 destination = self.dest / str(known_length)
-                response = io.BytesIO(payload)
-                response.headers = {"Content-Length": str(len(payload))} if known_length else {}
+                def response(url):
+                    data = io.BytesIO(payload)
+                    data.headers = {"Content-Length": str(len(payload))} if known_length else {}
+                    return data
                 progress = []
                 with (
                     patch("fetch_sources.read_page", return_value="SampleTool v1.27"),
-                    patch("fetch_sources.open_url", return_value=response) as network,
+                    patch("fetch_sources.open_url", side_effect=response) as network,
                     patch("fetch_sources.zipfile.ZipFile", wraps=zipfile.ZipFile) as validate,
                 ):
                     def report(received, total):
@@ -688,13 +794,15 @@ class RelfTest(unittest.TestCase):
                     self.assertTrue(validate.called)
                     progress.clear()
                     self.assertEqual(execute("fetch", job, destination, {}, report).status, "Latest")
+                    self.assertEqual(progress, [])
                     published = Path(json.loads((destination / job.id / "current.json").read_text())["published"]["path"])
                     published.unlink()
-                    self.assertEqual(execute("fetch", job, destination, {}, report).status, "Cached")
+                    validate.reset_mock()
+                    self.assertEqual(execute("fetch", job, destination, {}, report).status, "Updated")
                     self.assertEqual(execute("check", job, destination, {}, report).status, "Latest")
                     self.assertEqual(execute("verify", job, destination, {}, report).status, "Verified")
-                    self.assertEqual(progress, [])
-                    network.assert_called_once()
+                    self.assertEqual(progress, [(0, total), (len(payload), total), (None, None)])
+                    self.assertEqual(network.call_count, 2)
 
     def test_fast_download_progress_is_throttled_and_finishes_at_actual_size(self):
         payload = b"x" * (4 * 1024 * 1024)
@@ -820,7 +928,7 @@ class RelfTest(unittest.TestCase):
             self.assertEqual(result.status, "Canceled")
             self.assertEqual(self.manifest.read_bytes(), previous)
             self.assertEqual(target.read_bytes(), previous_output)
-            self.assertEqual([p.name for p in (self.job / "releases").iterdir()], [state["release"]])
+            self.assertEqual(list((self.job / "releases").iterdir()), [])
             self.assertFalse((self.job / "pending.json").exists())
             self.assertEqual(list(target.parent.glob(".releaseshelf-*")), [])
 
@@ -835,8 +943,8 @@ class RelfTest(unittest.TestCase):
     def test_unknown_version_and_missing_file_repair(self):
         self.cli("fetch")
         state = json.loads(self.manifest.read_text())
-        (self.job / "releases" / state["release"] / "files" / "SampleTool.exe").unlink()
-        missing = self.job / "releases" / state["release"] / "files" / "SampleTool.exe"
+        missing = Path(state["published"]["path"])
+        missing.unlink()
         self.assertIn(f"Missing file: {missing}", self.cli("check"))
         self.assertIn(f"Fetch needed: Missing file: {missing}", self.cli("fetch"))
         self.assertIn("Latest", self.cli("check"))
@@ -886,9 +994,9 @@ class RelfTest(unittest.TestCase):
 
         mappings.write_text(json.dumps({current_id: str(target)}))
         target.unlink()
-        self.assertIn("Cached: 1.27", self.cli("fetch"))
+        self.assertIn("Updated: 1.27", self.cli("fetch"))
         self.assertIn(f"SHA-256 verified: {target}", self.cli("verify"))
-        self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
 
     def test_conflicting_cache_and_target_ids_stop_before_fetch(self):
         current_id = self.recipe["id"]
@@ -903,15 +1011,14 @@ class RelfTest(unittest.TestCase):
         self.assertIn("Multiple target mappings", self.cli("fetch", expected_code=1))
         self.assertEqual(self.requests, [])
 
-    def test_repeat_checks_explain_changed_file_and_missing_release(self):
+    def test_repeat_checks_explain_changed_and_missing_published_file(self):
         self.cli("fetch")
         state = json.loads(self.manifest.read_text())
-        folder = self.job / "releases" / state["release"]
-        archive = folder / self.archive.name
-        archive.write_bytes(b"changed")
-        self.assertIn(f"SHA-256 mismatch: {archive}", self.cli("check"))
-        folder.rename(folder.with_name("moved"))
-        self.assertIn(f"Missing release folder: {folder}", self.cli("check"))
+        live = Path(state["published"]["path"])
+        live.write_bytes(b"changed")
+        self.assertIn(f"SHA-256 mismatch: {live}", self.cli("check"))
+        live.unlink()
+        self.assertIn(f"Missing file: {live}", self.cli("check"))
         self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
 
     def test_archive_only_with_fixed_filename_and_new_version(self):
@@ -924,14 +1031,18 @@ class RelfTest(unittest.TestCase):
         self.assertIn("Updated: 1.28", self.cli("fetch"))
         state = json.loads(self.manifest.read_text())
         self.assertNotEqual(previous, state["release"])
-        folder = self.job / "releases" / state["release"]
-        self.assertEqual(list(folder.parent.iterdir()), [folder])
-        self.assertEqual([p.name for p in folder.iterdir()], [self.recipe["filename"]])
+        saved = self.job / "releases" / previous
+        self.assertEqual(list(saved.parent.iterdir()), [saved])
+        self.assertEqual(state["history"], [{"version": "1.27", "release": previous}])
+        live = Path(state["published"]["path"])
+        self.assertEqual(list(live.parent.iterdir()), [live])
+        self.assertEqual(live.name, self.recipe["filename"])
         self.assertIn("Latest: 1.28", self.cli("check"))
 
     def test_fetch_latest_removes_legacy_cache_history(self):
         self.cli("fetch")
         releases = self.job / "releases"
+        duplicate = self.seed_legacy_current_cache(json.loads(self.manifest.read_text()))
         stale = releases / ("a" * 32)
         previous = self.job / ".previous-app"
         personal = releases / "personal"
@@ -944,9 +1055,11 @@ class RelfTest(unittest.TestCase):
         self.cli("check")
         self.cli("verify")
         self.assertTrue(stale.is_dir())
+        self.assertTrue(duplicate.is_dir())
         self.assertTrue(previous.is_dir())
         self.assertIn("Latest", self.cli("fetch"))
         self.assertFalse(stale.exists())
+        self.assertFalse(duplicate.exists())
         self.assertFalse(previous.exists())
         self.assertTrue((personal / "file.txt").is_file())
         self.assertIn("Verified", self.cli("verify"))
@@ -1055,12 +1168,14 @@ class RelfTest(unittest.TestCase):
             "download_resolver": "windows-11-english-x64", "filename": "image-{version}.iso",
         })
         payload = b"Windows installation media fixture"
-        response = io.BytesIO(payload)
-        response.headers = {"Content-Length": str(len(payload))}
+        def response(*args):
+            data = io.BytesIO(payload)
+            data.headers = {"Content-Length": str(len(payload))}
+            return data
         checksum = hashlib.sha256(payload).hexdigest()
         page = "version=26H2 sha256=" + checksum
         with (patch("fetch_sources.read_page", return_value=page),
-              patch("fetch_sources.open_windows_iso", return_value=response) as open_iso,
+              patch("fetch_sources.open_windows_iso", side_effect=response) as open_iso,
               patch("fetch_sources.open_url") as ordinary_download):
             self.assertEqual(execute("check", recipe, self.dest, {}).status, "Update available")
             open_iso.assert_not_called()
@@ -1072,8 +1187,8 @@ class RelfTest(unittest.TestCase):
             published = Path(state["published"]["path"])
             self.assertEqual(published.read_bytes(), payload)
             published.unlink()
-            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Cached")
-            open_iso.assert_called_once()
+            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Updated")
+            self.assertEqual(open_iso.call_count, 2)
             ordinary_download.assert_not_called()
 
     def test_windows_iso_mirror_requires_a_matching_publisher_checksum(self):
@@ -1122,9 +1237,10 @@ class RelfTest(unittest.TestCase):
             self.assertEqual(opener.return_value.open.call_args.args[0].full_url, url)
             self.assertTrue(unavailable.fp.closed)
 
-    def test_adopt_original_manifest_and_repair_live_file_without_downloading(self):
+    def test_adopt_original_manifest_then_repair_live_file_with_a_fresh_download(self):
         self.cli("fetch")
         state = json.loads(self.manifest.read_text())
+        folder = self.seed_legacy_current_cache(state)
         live = Path(state["published"]["path"])
         original = live.read_bytes()
         live.unlink()
@@ -1132,13 +1248,14 @@ class RelfTest(unittest.TestCase):
         self.manifest.write_text(json.dumps({key: state[key] for key in old_fields}))
         self.assertIn("Cached: 1.27", self.cli("fetch"))
         self.assertEqual(live.read_bytes(), original)
+        self.assertFalse(folder.exists())
         live.write_bytes(b"stale portable application")
         self.assertIn("Repair needed", self.cli("check"))
-        self.assertIn("Cached: 1.27", self.cli("fetch"))
+        self.assertIn("Updated: 1.27", self.cli("fetch"))
         self.assertIn("Latest: 1.27", self.cli("fetch"))
         self.assertEqual(live.read_bytes(), original)
-        self.assertEqual(json.loads(self.manifest.read_text())["release"], state["release"])
-        self.assertEqual(self.requests.count("/sample-tool.zip"), 1)
+        self.assertNotEqual(json.loads(self.manifest.read_text())["release"], state["release"])
+        self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
 
     def test_quick_check_and_offline_full_verification(self):
         self.cli("fetch")
@@ -1160,10 +1277,13 @@ class RelfTest(unittest.TestCase):
         raw = {**self.recipe, "sha256": hashlib.sha256(data).hexdigest()}
         del raw["extract"]
         recipe = Recipe.from_data(raw)
-        response = io.BytesIO(data)
-        response.headers = {"Content-Length": str(len(data))}
+        def response(url):
+            file = io.BytesIO(data)
+            file.headers = {"Content-Length": str(len(data))}
+            return file
+
         with (patch("fetch_sources.read_page", return_value="SampleTool v1.27"),
-              patch("fetch_sources.open_url", return_value=response) as publisher,
+              patch("fetch_sources.open_url", side_effect=response) as publisher,
               patch("fetch_sources.digest", wraps=digest) as downloaded_hash,
               patch("fetch_store.digest", wraps=digest) as local_hash):
             self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Updated")
@@ -1174,9 +1294,10 @@ class RelfTest(unittest.TestCase):
 
             Path(state["published"]["path"]).unlink()
             local_hash.reset_mock()
-            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Cached")
-            self.assertEqual(local_hash.call_count, 2)  # Cached archive and staged publication.
-            publisher.assert_called_once()
+            self.assertEqual(execute("fetch", recipe, self.dest, {}).status, "Updated")
+            local_hash.assert_called_once()
+            self.assertEqual(downloaded_hash.call_count, 2)
+            self.assertEqual(publisher.call_count, 2)
             self.assertEqual(execute("verify", recipe, self.dest, {}).status, "Verified")
 
     def test_version_precedence(self):
@@ -1234,7 +1355,7 @@ class RelfTest(unittest.TestCase):
         self.assertEqual(self.manifest.read_bytes(), state)
         self.assertFalse((self.job / "pending.json").exists())
         self.assertEqual(self.requests.count("/SampleTool.exe"), 2)
-        self.assertEqual([path.name for path in (self.job / "releases").iterdir()], [json.loads(state)["release"]])
+        self.assertEqual(list((self.job / "releases").iterdir()), [])
 
         live.write_bytes(package.read_bytes())
         package.write_bytes(package.read_bytes() + b"new build of the old version")
@@ -1270,7 +1391,7 @@ class RelfTest(unittest.TestCase):
             package.writestr("help.txt", "older help")
             package.writestr("notes.txt", "older notes")
         with target.open("rb"):
-            self.assertIn("Waiting for the app to close", self.cli("fetch", expected_code=2))
+            self.assertIn("Files in use", self.cli("fetch", expected_code=2))
         target.write_bytes(installed)
         (target.parent / "help.txt").write_text("newer help")
         recipe = Recipe.read(self.recipe_file)
@@ -1296,16 +1417,17 @@ class RelfTest(unittest.TestCase):
             for name in self.recipe["extract"]:
                 package.writestr(name, "updated")
         with live.open("rb"):
-            self.assertIn("Waiting for the app to close", self.cli("fetch", expected_code=2))
+            self.assertIn("Files in use", self.cli("fetch", expected_code=2))
             self.assertEqual(live.read_bytes(), old)
             self.assertEqual(self.manifest.read_bytes(), old_state)
-            self.assertIn("Waiting for the app to close", self.cli("check", expected_code=2))
-            self.assertIn("Waiting for the app to close", self.cli("verify", expected_code=1))
+            self.assertIn("Files in use", self.cli("check", expected_code=2))
+            self.assertIn("Files in use", self.cli("verify", expected_code=1))
         self.assertIn("Cached: 1.28", self.cli("fetch"))
         self.assertEqual(live.read_bytes(), b"updated")
         self.assertFalse((self.job / "pending.json").exists())
-        self.assertEqual([p.name for p in (self.job / "releases").iterdir()],
-                         [json.loads(self.manifest.read_text())["release"]])
+        saved = self.job / "releases" / json.loads(old_state)["release"]
+        self.assertEqual(list(saved.parent.iterdir()), [saved])
+        self.assertEqual((saved / "files" / "SampleTool.exe").read_bytes(), old)
         self.assertEqual(self.requests.count("/sample-tool.zip"), 2)
 
     @unittest.skipUnless(os.name == "nt", "Windows executable sharing semantics")
@@ -1324,7 +1446,7 @@ class RelfTest(unittest.TestCase):
                 with zipfile.ZipFile(self.archive, "w") as package:
                     for name in self.recipe["extract"]:
                         package.writestr(name, "updated")
-                self.assertIn("Waiting for the app to close", self.cli("fetch", expected_code=2))
+                self.assertIn("Files in use", self.cli("fetch", expected_code=2))
                 self.assertEqual((live.parent / "help.txt").read_text(), "help")
                 self.assertFalse((self.job / ".previous-app").exists())
             finally:
@@ -1365,6 +1487,7 @@ class RelfTest(unittest.TestCase):
             package.write(exe, "portable.exe")
         self.cli("fetch")
         state = json.loads(self.manifest.read_text())
+        self.seed_legacy_current_cache(state)
         legacy_fields = {key: self.recipe[key] for key in
                          ("id", "page", "version_pattern", "download", "extract", "publish_exe")}
         legacy_fields["archive"] = self.archive.name

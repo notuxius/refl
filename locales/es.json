@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "Aquí aparecen los elementos con problemas de origen, de archivos o de publicación.",
   "Unknown": "Desconocido",
   "Pending": "Pendiente",
+  "Files in use": "Archivos en uso",
   "Waiting for the app to close": "Esperando a que se cierre la aplicación",
   "Downgrade skipped": "Se omitió la vuelta a una versión anterior",
   "Kept version {installed} because {offered} is older.": "Se conservó la versión {installed} porque {offered} es anterior.",

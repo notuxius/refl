@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "Item dengan masalah sumber, berkas, atau publikasi muncul di sini.",
   "Unknown": "Tidak diketahui",
   "Pending": "Menunggu",
+  "Files in use": "File sedang digunakan",
   "Waiting for the app to close": "Menunggu aplikasi ditutup",
   "Downgrade skipped": "Penurunan versi dilewati",
   "Kept version {installed} because {offered} is older.": "Versi {installed} dipertahankan karena {offered} adalah versi yang lebih lama.",

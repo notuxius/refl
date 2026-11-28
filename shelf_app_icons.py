@@ -217,8 +217,12 @@ def load_app_icon(job, dest):
         published = state.get("published", {})
         published_path = Path(published.get("path", ""))
         local_published = published_path.is_absolute() and not published_path.drive.startswith("\\\\")
-        if primary.lower().endswith((".exe", ".msi")) and local_published:
+        if local_published and primary.lower().endswith((".exe", ".msi", ".zip")):
             candidates.append((published_path, primary, published.get("stat")))
+        if local_published:
+            for member, recorded in published.get("stats", {}).items():
+                if member != primary and member.startswith("files/") and member.lower().endswith((".exe", ".msi")):
+                    candidates.append((published_path.parent / member[6:], member, recorded))
         members = dict.fromkeys([primary, *("files/" + name for name in job.extract)])
         for member in members:
             if member.lower().endswith((".exe", ".msi")):
@@ -227,8 +231,6 @@ def load_app_icon(job, dest):
         if archive.lower().endswith(".zip"):
             path = root / "releases" / state["release"] / archive
             candidates.append((path, archive, state.get("stats", {}).get(archive)))
-            if primary == archive and local_published:
-                candidates.append((published_path, archive, published.get("stat")))
         for path, member, recorded in candidates:
             if state["sha256"].get(member) and path.is_file():
                 metadata = stamp(path)

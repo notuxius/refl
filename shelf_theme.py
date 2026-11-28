@@ -236,18 +236,18 @@ def bind_button_badge(button, badge, sync):
 def style_dropdowns(style, palette):
     combo_arrow = "Relf.comboArrow"
     down, up = "RelfDropdownDown", "RelfDropdownUp"
-    field, hover, focus = "RelfComboField", "RelfComboHover", "RelfComboFocus"
+    field, hover = "RelfComboField", "RelfComboHover"
     if combo_arrow not in style.element_names():
         # Leave 8 px before the triangle and 12 px between it and the button edge.
         for image in (down, up):
             style.tk.call("image", "create", "photo", image, "-width", 31, "-height", 6)
         style.element_create(combo_arrow, "image", down, ("pressed", up))
         # A square, fully painted field avoids clam's exposed corner pixels.
-        for image in (field, hover, focus):
+        for image in (field, hover):
             style.tk.call("image", "create", "photo", image, "-width", 64, "-height", 32)
         combo_field = "Relf.comboField"
-        style.element_create(combo_field, "image", field, ("pressed", focus), ("focus", focus),
-                             ("active", hover), border=1, width=1, height=1, sticky="nsew")
+        style.element_create(combo_field, "image", field, ("active", "!focus", "!pressed", hover),
+                             border=1, width=1, height=1, sticky="nsew")
         style.layout("TCombobox", [(combo_field, {"sticky": "nswe", "children": [
             (combo_arrow, {"side": "right", "sticky": ""}),
             ("Combobox.padding", {"sticky": "nswe", "children": [
@@ -259,7 +259,7 @@ def style_dropdowns(style, palette):
     for row in range(6):
         for image, y in ((down, row), (up, 5 - row)):
             style.tk.call(image, "put", palette.muted, "-to", 8 + row, y, 19 - row, y + 1)
-    for image, fill in ((field, palette.surface), (hover, palette.subtle), (focus, palette.selection)):
+    for image, fill in ((field, palette.surface), (hover, palette.subtle)):
         style.tk.call(image, "put", palette.line, "-to", 0, 0, 64, 32)
         style.tk.call(image, "put", fill, "-to", 1, 1, 63, 31)
 
@@ -342,11 +342,11 @@ def style_widgets(s, p):
     s.configure("TEntry", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
                 selectbackground=p.selection, selectforeground=p.text, lightcolor=p.line, padding=5)
     s.map("TEntry", bordercolor=[], lightcolor=[],
-          fieldbackground=[("disabled", p.subtle), ("focus", p.selection)])
+          fieldbackground=[("disabled", p.subtle)])
     s.configure("TCombobox", fieldbackground=p.surface, foreground=p.text, insertcolor=p.text,
                 selectbackground=p.selection, selectforeground=p.text, padding=(8, 6),
                 postoffset=(0, 1, 0, -2))  # Overlap the field outline by 1 px in either direction.
-    s.map("TCombobox", fieldbackground=[("disabled", p.subtle), ("focus", p.selection)], foreground=[])
+    s.map("TCombobox", fieldbackground=[("disabled", p.subtle)], foreground=[])
     # Blend clam's bevel into the fill and keep the dropdown edge neutral.
     s.configure("TMenubutton", padding=(10, 7, "23p", 7), background=p.surface, borderwidth=1,
                 bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface)

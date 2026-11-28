@@ -13,7 +13,7 @@ from shelf_i18n import tr
 from shelf_message import error_detail
 
 
-def install_and_restore(path, job, recipe_path, dest, restore_settings):
+def install_and_restore(path, job, recipe_path, dest, restore_settings, *, restore_companions=True):
     """Wait for Windows to finish installation before restoring this item's companions."""
     shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     # Supply paths as data so quotes and PowerShell metacharacters stay literal.
@@ -38,9 +38,10 @@ def install_and_restore(path, job, recipe_path, dest, restore_settings):
     if restore_settings and not job.companions.script:
         if not apply_published_settings(replace(job, apply_custom_settings=True), dest):
             raise ValueError(f"Could not locate the published settings destination for {path.name}.")
-    if job.companions.script:
+    if restore_companions and job.companions.script:
         open_companion(recipe_path.parent / "companions" / recipe_path.stem,
                        job.companions.script, "run", job.companions.admin, app_folder=path.parent)
+    return result.returncode
 
 
 def open_companion(root, relative, action, admin=False, *, app_folder=None):

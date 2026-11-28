@@ -20,7 +20,8 @@ from unittest.mock import patch
 import zipfile
 
 from fetch_store import Result, downgrade_result
-from releaseshelf import GITHUB_PAUSED, default_destination, destination_preference_path
+from releaseshelf import (GITHUB_PAUSED, app_folder_preference_path, default_destination, destination_preference_path,
+                          previous_versions_preference_path, read_destination, read_previous_versions)
 from shelf_categories import MOVE, RENAME, CategoryDialog, change_category
 from shelf_delete import DELETE, FOLDER, delete_item, deletion_plan
 from shelf_checkboxes import header_image
@@ -135,6 +136,16 @@ class DesktopTest(unittest.TestCase):
         button.invoke()
         self.wait_until_idle()
 
+    def stage_pending_download_for(self, key):
+        root = self.ui.jobs[key].cache_root(self.dest)
+        saved = json.loads((root / "current.json").read_text())
+        published = Path(saved.pop("published")["path"])
+        cache = root / "releases" / saved["release"]
+        cache.mkdir()
+        (cache / saved["archive"]).write_bytes(published.read_bytes())
+        (root / "pending.json").write_text(json.dumps(saved))
+        return published
+
     def wait_until_idle(self):
         deadline = monotonic() + 5
         while self.ui.busy and monotonic() < deadline:
@@ -165,6 +176,85 @@ class DesktopTest(unittest.TestCase):
             self.right_click_app(first).buttons["Open app folder"].invoke()
             launch.assert_called_once()
             self.assertIn("Get updates", self.ui.status.get())
+
+    def test_right_click_opens_configured_app_folder_with_an_older_published_path(self):
+        key = self.keys[0]
+        job = self.ui.jobs[key]
+        old_folder = job.cache_root(self.dest) / "current"
+        old_folder.mkdir(parents=True)
+        (old_folder.parent / "current.json").write_text(json.dumps({
+            "version": "1", "release": "a" * 32, "sha256": {},
+            "published": {"path": str(old_folder / "app.exe")},
+        }))
+        folder = self.dest.parent / "Software" / "App"
+        folder.mkdir(parents=True)
+        self.ui.targets.write_text(json.dumps({job.id: str(folder / "{filename}")}))
+        with patch("shelf_window.os.startfile", create=True) as launch:
+            self.right_click_app(key).buttons["Open app folder"].invoke()
+            launch.assert_called_once_with(folder)
+
+    @unittest.skipUnless(sys.platform == "win32", "Full-folder publication uses Windows tar")
+    def test_install_fetches_and_runs_packaged_command(self):
+        second = self.keys[1]
+        recipe = Path(second)
+        recipe.write_text(json.dumps({**json.loads(recipe.read_text()), "filename": "Setup.zip",
+                                      "extract_folder": ".", "extract": ["Install.cmd"]}))
+        self.ui.reload()
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as package:
+            package.writestr("Install.cmd", "@exit /b 0")
+            package.writestr("Setup.ps1", "exit 0")
+            package.writestr("README.txt", "Installation guide")
+        archive.seek(0)
+        archive.headers = {"Content-Length": str(len(archive.getbuffer()))}
+        with (patch("fetch_sources.read_page", return_value="1"),
+              patch("fetch_sources.open_url", return_value=archive) as download,
+              patch("shelf_window.os.startfile", create=True) as launch):
+            self.click(self.right_click_app(second).buttons["Install"])
+            self.assertEqual(self.ui.results[second].status, "Updated")
+            folder = self.dest / "beta" / "current"
+            self.assertTrue((folder / "Setup.ps1").is_file())
+            launch.assert_called_once_with(folder / "Install.cmd", cwd=folder)
+            self.right_click_app(second).buttons["Install"].invoke()
+            self.assertEqual(launch.call_count, 2)
+            launch.assert_called_with(folder / "Install.cmd", cwd=folder)
+            download.assert_called_once()
+
+    def test_app_folder_and_retention_options_save_preferences(self):
+        with patch.dict(os.environ, LOCALAPPDATA=str(self.appearance.parent)):
+            self.ui.open_options()
+            options = self.ui.options
+            library = self.dest.parent / "Software"
+            library.mkdir()
+            with patch("shelf_options.filedialog.askdirectory", return_value=str(library)):
+                options.app_folder_browse.invoke()
+            self.assertEqual(read_destination(app_folder_preference_path()), library)
+            self.assertEqual(options.app_folder_hint.winfo_manager(), "grid")
+            spinbox = options.previous_versions_entry
+            self.assertIsInstance(spinbox, ttk.Spinbox)
+            self.assertEqual(spinbox.get(), "1")
+            self.assertEqual(read_previous_versions(previous_versions_preference_path()), 1)
+            self.root.deiconify()
+            self.root.update()
+            for event, value in (("<<Increment>>", "2"), ("<<Decrement>>", "1"),
+                                 ("<<Decrement>>", "0"), ("<<Decrement>>", "0")):
+                spinbox.event_generate(event)
+                self.assertEqual(spinbox.get(), value)
+            options.save_previous_versions_button.invoke()
+            self.assertEqual(read_previous_versions(previous_versions_preference_path()), 0)
+            self.assertEqual(self.ui.previous_versions, 0)
+            options.destroy()
+            self.ui.open_options()
+            self.assertEqual(self.ui.options.selected_app_folder, library)
+            self.assertEqual(self.ui.options.previous_versions_entry.get(), "0")
+            self.ui.options.destroy()
+            self.ui.app_root = library
+            key = self.keys[0]
+            folder = library / self.ui.jobs[key].id
+            folder.mkdir()
+            with patch("shelf_window.os.startfile", create=True) as launch:
+                self.right_click_app(key).buttons["Open app folder"].invoke()
+                launch.assert_called_once_with(folder)
 
     def test_install_opens_clicked_published_package(self):
         first, second = self.keys
@@ -206,7 +296,7 @@ class DesktopTest(unittest.TestCase):
                 self.wait_until_idle()
             self.assertEqual(package.read_bytes(), b"download")
             launch.assert_called_once_with(package, cwd=package.parent)
-            package.unlink()
+            self.stage_pending_download_for(second).unlink()
             self.click(self.right_click_app(second).buttons["Install"])
             self.assertEqual(self.ui.results[second].status, "Cached")
             self.assertEqual(launch.call_count, 2)
@@ -238,7 +328,7 @@ class DesktopTest(unittest.TestCase):
 
     def test_install_local_file(self):
         path = self.ui.catalog / "local.json"
-        for name, enabled in (("setup.exe", True), ("download.zip", False)):
+        for name, enabled in (("setup.exe", True), ("download.iso", False)):
             package = self.ui.catalog / name
             package.touch()
             path.write_text(json.dumps({"id": "local", "local_path": name}))
@@ -252,6 +342,73 @@ class DesktopTest(unittest.TestCase):
                     launch.assert_called_once_with(package, cwd=package.parent)
                     self.assertIn("Launch failed", self.ui.status.get())
             self.ui.app_menu.dismiss()
+
+    @unittest.skipUnless(sys.platform == "win32", "Uses Windows tar and the Start menu shell")
+    def test_install_portable_archive_uses_programs_and_creates_shortcut(self):
+        key = self.keys[1]
+        recipe = Path(key)
+        recipe.write_text(json.dumps({**json.loads(recipe.read_text()), "name": "Portable Tool", "filename": "tool.zip"}))
+        self.ui.reload()
+        local = self.dest.parent / "LocalAppData"
+        folder = local / "Programs" / "Portable Tool"
+        link = self.dest.parent / "Start Menu" / "Portable Tool.lnk"
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as package:
+            package.writestr("tool/Portable.exe", "fixture")
+            package.writestr("tool/bin/Helper.exe", "helper")
+            package.writestr("tool/data/book.txt", "data")
+        payload.seek(0)
+        payload.headers = {"Content-Length": str(len(payload.getbuffer()))}
+        show_picker = self.ui.choose_portable_launcher
+
+        def choose_launcher(choices):
+            def select():
+                picker = next(widget for widget in descendants(self.root) if isinstance(widget, ttk.Combobox))
+                picker.set("tool/Portable.exe")
+                picker.event_generate("<<ComboboxSelected>>")
+                dialog = picker.winfo_toplevel()
+                button = next(widget for widget in descendants(dialog)
+                              if isinstance(widget, ttk.Button) and widget.cget("text") == "Install")
+                button.invoke()
+
+            self.root.after(50, select)
+            return show_picker(choices)
+
+        with (patch.dict(os.environ, LOCALAPPDATA=str(local)),
+              patch("fetch_sources.read_page", return_value="1"),
+              patch("fetch_sources.open_url", return_value=payload) as download,
+              patch("shelf_portable_install.shortcut_path", return_value=link),
+              patch.object(self.ui, "choose_portable_launcher", side_effect=choose_launcher) as choose,
+              patch("shelf_window.os.startfile", create=True) as launch):
+            button = self.right_click_app(key).buttons["Install"]
+            self.assertTrue(button.instate(["!disabled"]))
+            self.click(button)
+            self.assertEqual(self.ui.status.get(), "Installed Portable Tool.")
+            self.assertEqual((folder / "tool/data/book.txt").read_text(), "data")
+            installed = folder / "tool/Portable.exe"
+            self.assertEqual(installed.read_text(), "fixture")
+            self.assertTrue(link.is_file())
+            native = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            script = "(New-Object -ComObject WScript.Shell).CreateShortcut($env:RELF_TEST_LINK).TargetPath"
+            target = subprocess.check_output([str(native), "-NoProfile", "-NonInteractive", "-Command", script],
+                                             env={**os.environ, "RELF_TEST_LINK": str(link)}, text=True,
+                                             creationflags=subprocess.CREATE_NO_WINDOW).strip()
+            self.assertEqual(Path(target), installed)
+            self.assertEqual(self.ui.app_folder(self.ui.jobs[key]), folder)
+            (folder / "notes.txt").write_text("personal data")
+            self.click(self.right_click_app(key).buttons["Install"])
+            self.assertEqual(self.ui.status.get(), "Installed Portable Tool.")
+            self.assertEqual((folder / "notes.txt").read_text(), "personal data")
+            original_link = link.read_bytes()
+            with patch("shelf_portable_install.write_shortcut", side_effect=OSError("Shortcut write failed")):
+                self.click(self.right_click_app(key).buttons["Install"])
+            self.assertIn("Shortcut write failed", self.ui.status.get())
+            self.assertEqual((folder / "notes.txt").read_text(), "personal data")
+            self.assertTrue(installed.is_file())
+            self.assertEqual(link.read_bytes(), original_link)
+            choose.assert_called_once_with(("tool/Portable.exe", "tool/bin/Helper.exe"))
+            download.assert_called_once()
+            launch.assert_not_called()
 
     def test_close_and_install_waits_for_running_portable_app(self):
         key = self.keys[1]
@@ -2009,8 +2166,7 @@ class DesktopTest(unittest.TestCase):
                         self.assertEqual(button.winfo_rootx() - rail.winfo_rootx(), inset)
                         self.assertEqual(right_edge(rail) - right_edge(button), inset)
                 self.assertEqual(right_edge(rail) - right_edge(toggle), inset)
-                self.assertLess(right_edge(options), toggle.winfo_rootx())
-                self.assertEqual(options.winfo_width(), options.winfo_reqwidth())
+                self.assertEqual(toggle.winfo_rootx() - right_edge(options), 3)
                 left, _, right, _ = options["padding"]
                 self.assertEqual(left, right)
                 self.assertEqual(toggle.winfo_rooty(), options.winfo_rooty())
@@ -2288,13 +2444,62 @@ class DesktopTest(unittest.TestCase):
         self.root.update()
         listing = f"{combo}.popdown.f.l"
         self.assertEqual(combo.tk.call(listing, "cget", "-background"), self.ui.palette.surface)
-        self.assertEqual(combo.tk.call(listing, "cget", "-selectbackground"), self.ui.palette.selection)
+        self.assertEqual(combo.tk.call(listing, "cget", "-selectbackground"), editor.detail.cget("selectbackground"))
+        self.assertEqual(combo.tk.call(listing, "cget", "-selectforeground"), editor.detail.cget("selectforeground"))
         combo.tk.call("event", "generate", listing, "<Up>")
         combo.tk.call("event", "generate", listing, "<Return>")
         self.assertEqual(editor.form_data()["category"], "audio")
         combo.set("New category")
         editor.save()
         self.assertEqual(json.loads(first.read_text())["category"], "New category")
+
+    def test_edit_item_text_selection_matches_item_info_in_both_modes(self):
+        self.root.deiconify()
+        self.ui.open_editor(Path(self.keys[0]))
+        editor = self.ui.editor
+        entries = {str(w.cget("textvariable")): w for w in descendants(editor) if isinstance(w, ttk.Entry)}
+        general = editor.tabs.select()
+        filename = entries[str(editor.fields["filename"])]
+        multiline = editor.text_area
+        multiline.insert("1.0", "Example")
+        for mode in ("Light", "Dark"):
+            self.ui.mode.set(mode)
+            self.ui.refresh_theme()
+            palette = self.ui.palette
+            selection_bg = editor.detail.cget("selectbackground")
+            selection_fg = editor.detail.cget("selectforeground")
+            editor.tabs.select(general)
+            self.root.update()
+            for key in ("id", "name", "category"):
+                with self.subTest(mode=mode, field=key):
+                    editor.fields[key].set("Example")
+                    entry = entries[str(editor.fields[key])]
+                    entry.focus_force()
+                    entry.selection_range(0, 3)
+                    self.root.update()
+                    self.assertTrue(entry.selection_present())
+                    self.assertTrue(entry.instate(("focus",)))
+                    style, state = entry.winfo_class(), entry.state()
+                    lookup = self.ui.style.lookup
+                    self.assertNotEqual(lookup(style, "selectbackground", state),
+                                        lookup(style, "fieldbackground", state))
+                    self.assertEqual(lookup(style, "selectbackground", state), selection_bg)
+                    self.assertEqual(lookup(style, "selectforeground", state), selection_fg)
+                    expected_field = "Relf.comboField" if key == "category" else "Entry.field"
+                    self.assertEqual(self.ui.style.layout(style)[0][0], expected_field)
+                    if key != "category":
+                        self.assertEqual(lookup(style, "bordercolor", state), palette.line)
+            editor.tabs.select(filename.master)
+            self.root.update()
+            multiline.focus_force()
+            multiline.tag_add("sel", "1.0", "1.3")
+            self.root.update()
+            self.assertNotEqual(multiline.cget("background"), selection_bg)
+            self.assertEqual(multiline.cget("selectbackground"), selection_bg)
+            self.assertEqual(multiline.cget("selectforeground"), selection_fg)
+            self.assertEqual(int(multiline.cget("highlightthickness")), 1)
+            self.assertEqual(multiline.cget("highlightbackground"), palette.line)
+            self.assertEqual(multiline.cget("highlightcolor"), palette.line)
 
     def test_move_and_rename_categories_from_context_menus(self):
         ui = self.ui
@@ -3122,9 +3327,9 @@ class DesktopTest(unittest.TestCase):
             with patch("fetch_sources.open_url", side_effect=cached_file):
                 self.click(self.ui.all_buttons["fetch"])
             self.assertEqual([self.ui.results[key].status for key in self.keys], ["Updated", "Updated"])
-            (self.dest / "beta" / "current" / "beta.bin").unlink()
+            self.stage_pending_download_for(self.keys[1]).unlink()
 
-            # The two utilities already have valid archives. Insert four new ISO recipes around them.
+            # Alpha is current and beta has a staged download. Insert four ISO recipes.
             names = ("amber", "delta", "epsilon", "gamma")
             for name in names:
                 (self.ui.catalog / f"{name}.json").write_text(json.dumps({
@@ -3298,7 +3503,7 @@ class DesktopTest(unittest.TestCase):
             self.assertFalse(row_bar.winfo_manager())
 
             # Repairing publication from the verified cache performs no transfer.
-            target.unlink()
+            self.stage_pending_download_for(key).unlink()
             shown = []
             for progress in (*progress_widgets, row_bar):
                 progress.bind("<Map>", lambda event: shown.append(event.widget))
@@ -4025,6 +4230,98 @@ class DesktopTest(unittest.TestCase):
 
         self.assertEqual(self.ui.view_counts["progress"].get(), "1")
 
+    def test_update_requests_close_only_after_download_and_relaunches_after_reopening(self):
+        key = self.keys[0]
+        live = self.dest.parent / "Portable.exe"
+        live.write_bytes(b"old")
+        self.dest.mkdir()
+        self.ui.targets.write_text(json.dumps({"alpha": str(live)}))
+        response = GatedDownload()
+        running = Event()
+        running.set()
+
+        def is_running(path):
+            return path == live and running.is_set()
+
+        def request_close(path):
+            self.assertEqual(path, live)
+            self.assertEqual(live.read_bytes(), b"old")
+            self.assertEqual([p.read_bytes() for p in (self.dest / "alpha" / "releases").glob("*/alpha.bin")],
+                             [b"download"])
+            return True
+
+        with (patch("fetch_sources.read_page", return_value="1") as publisher,
+              patch("fetch_sources.open_url", return_value=response) as download,
+              patch("fetch_store.request_app_close", side_effect=request_close) as close,
+              patch("fetch_store.app_is_running", side_effect=is_running),
+              patch("shelf_window.app_is_running", side_effect=is_running),
+              patch("shelf_window.os.startfile", create=True) as launch):
+            self.right_click_app(key, install_label="Close and Install").buttons["Get updates"].invoke()
+            try:
+                self.wait_for(response.waiting.is_set)
+                close.assert_not_called()
+                self.assertEqual(live.read_bytes(), b"old")
+            finally:
+                response.resume.set()
+                self.wait_until_idle()
+
+            self.assertEqual(self.ui.displayed_status(key), "Waiting for the app to close")
+            close.assert_called_once_with(live)
+            launch.assert_not_called()
+
+            self.root.after_cancel(self.ui.publication_timer)
+            self.ui.publication_timer = None
+            window = tk.Toplevel(self.root)
+            self.addCleanup(window.destroy)
+            reopened = ShelfWindow(window, self.ui.catalog, self.dest, self.ui.targets, appearance_file=self.appearance)
+            self.assertEqual(reopened.displayed_status(key), "Waiting for the app to close")
+            launch.side_effect = lambda *args, **kwargs: self.assertEqual(live.read_bytes(), b"download")
+            running.clear()
+            self.wait_for(lambda: reopened.displayed_status(key) == "Cached" and not reopened.busy)
+            launch.assert_called_once_with(live, cwd=live.parent)
+            close.assert_called_once()
+            publisher.assert_called_once()
+            download.assert_called_once()
+        self.assertFalse((self.dest / "alpha" / "pending.json").exists())
+
+    def test_app_update_with_separate_installer_only_relaunches_after_success(self):
+        key = self.keys[0]
+        app = self.dest.parent / "Installed app.exe"
+        app.touch()
+        recipe = Path(key)
+        data = json.loads(recipe.read_text())
+        data.update(download="https://publisher.example/setup.msi", running_exe=str(app), version_pattern=r"(\d+)")
+        recipe.write_text(json.dumps(data))
+        self.ui.reload()
+        with (patch("fetch_sources.read_page") as page,
+              patch("fetch_sources.open_url", side_effect=download_fixture),
+              patch("fetch_store.request_app_close", return_value=True) as close,
+              patch("fetch_store.app_is_running", return_value=False),
+              patch("shelf_window.app_is_running", return_value=False),
+              patch("shelf_window.install_and_restore") as install,
+              patch("shelf_window.os.startfile", create=True) as launch):
+            def finish_install(package, *_args, **_kwargs):
+                self.assertEqual(package.name, "setup.msi")
+                self.assertEqual(package.read_bytes(), b"fixture")
+                launch.assert_not_called()
+                if page.return_value == "1":
+                    raise ValueError("Installer exited with code 1603")
+                return 0
+
+            install.side_effect = finish_install
+            page.return_value = "1"
+            self.click(self.right_click_app(key).buttons["Get updates"])
+            self.wait_for(lambda: self.ui.displayed_status(key) == "Error" and not self.ui.busy)
+            self.assertIn("1603", self.ui.results[key].detail)
+            launch.assert_not_called()
+
+            page.return_value = "2"
+            self.click(self.right_click_app(key).buttons["Get updates"])
+            self.wait_for(lambda: self.ui.displayed_status(key) == "Cached" and not self.ui.busy)
+            self.assertEqual(close.call_count, 2)
+            self.assertEqual(install.call_count, 2)
+            launch.assert_called_once_with(app, cwd=app.parent)
+
     @unittest.skipUnless(os.name == "nt", "Windows sharing semantics")
     def test_locked_update_resumes_offline_after_reopening(self):
         first, second = self.keys
@@ -4032,7 +4329,7 @@ class DesktopTest(unittest.TestCase):
         live.write_bytes(b"old")
         self.dest.mkdir()
         self.ui.targets.write_text(json.dumps({"alpha": str(live)}))
-        waiting = "Waiting for the app to close"
+        waiting = "Files in use"
         with live.open("rb"):
             with (patch("fetch_sources.read_page", return_value="1"),
                   patch("fetch_sources.open_url", side_effect=download_fixture) as download):

@@ -212,6 +212,7 @@
   "Items with source, file, or publication problems appear here.": "উৎস, ফাইল বা প্রকাশে সমস্যা আছে এমন আইটেম এখানে দেখানো হয়।",
   "Unknown": "অজানা",
   "Pending": "অপেক্ষমাণ",
+  "Files in use": "ফাইল ব্যবহার হচ্ছে",
   "Waiting for the app to close": "অ্যাপটি বন্ধ হওয়ার অপেক্ষায়",
   "Downgrade skipped": "পুরোনো সংস্করণে ফেরা এড়ানো হয়েছে",
   "Kept version {installed} because {offered} is older.": "{installed} সংস্করণটি রাখা হয়েছে, কারণ {offered} সংস্করণটি আরও পুরোনো।",
