@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk
 
+from shelf_focus import tab_focus
 from shelf_icons import set_button_icon
 from shelf_i18n import tr
 from shelf_theme import ARROW_DOWN, ARROW_UP, bind_button_badge, work_area
@@ -26,7 +27,9 @@ class AppMenu(tk.Toplevel):
         self.bind("<ButtonPress>", self.outside_press)
         self.bind("<FocusOut>", self.focus_left)
         self.bind("<Escape>", self.dismiss)
-        self.bind("<Tab>", self.dismiss)
+        self.bind("<Tab>", lambda _: self.traverse(1))
+        self.bind("<Shift-Tab>", lambda _: self.traverse(-1))
+        self.bind("<<PrevWindow>>", lambda _: self.traverse(-1))
         self.bind("<Return>", self.invoke_focused)
         self.bind("<KP_Enter>", self.invoke_focused)
         self.bind("<Down>", lambda _: self.move_focus(1))
@@ -96,6 +99,10 @@ class AppMenu(tk.Toplevel):
         if event.widget in self.buttons.values():
             event.widget.invoke()
         return "break"
+
+    def traverse(self, step):
+        self.dismiss()
+        return tab_focus(self.master, step)
 
     def popup(self, screen_x, screen_y, *, keyboard=False):
         self.update_idletasks()

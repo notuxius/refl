@@ -63,8 +63,8 @@ class LanguageMenu(DropdownMenu):
             button.bind("<FocusOut>", lambda _, c=code: self.focus_changed(c, False))
             for key in ("<Return>", "<KP_Enter>", "<space>"):
                 button.bind(key, self.invoke_focused)
-        self.bind("<Left>", lambda _: self.switch_column())
-        self.bind("<Right>", lambda _: self.switch_column())
+        self.bind("<Left>", lambda _: self.move_column(0))
+        self.bind("<Right>", lambda _: self.move_column(1))
         self.bind("<Home>", lambda _: self.focus_code(self.codes[0]))
         self.bind("<End>", lambda _: self.focus_code(self.codes[-1]))
         self.bind("<KeyPress>", self.type_to_jump)
@@ -145,9 +145,9 @@ class LanguageMenu(DropdownMenu):
         column_codes = self.codes[column * self.rows:(column + 1) * self.rows]
         return self.focus_code(column_codes[(row + step) % len(column_codes)])
 
-    def switch_column(self):
-        column, row = divmod(self.focused_index(), self.rows)
-        return self.focus_code(self.codes[min((1 - column) * self.rows + row, len(self.codes) - 1)])
+    def move_column(self, column):
+        row = self.focused_index() % self.rows
+        return self.focus_code(self.codes[min(column * self.rows + row, len(self.codes) - 1)])
 
     def type_to_jump(self, event):
         if not event.char or not event.char.isprintable() or event.state & 0x000c:

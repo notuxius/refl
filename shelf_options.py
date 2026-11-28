@@ -113,7 +113,7 @@ class OptionsWindow(tk.Toplevel):
         for column, name in enumerate(THEME_MODES):
             modes.columnconfigure(column, weight=1, uniform="mode")
             button = ttk.Radiobutton(modes, value=name, variable=mode, command=on_change,
-                                     style="Theme.Toolbutton", compound="left", takefocus=True)
+                                     style="Theme.Toolbutton", compound="left")
             button.grid(row=0, column=column, sticky="ew")
             self.mode_buttons[name] = button
 
@@ -132,7 +132,7 @@ class OptionsWindow(tk.Toplevel):
             self.swatches[name] = swatch
             button = ttk.Radiobutton(choices, image=swatch, compound="left",
                                      variable=palette_name, value=name, command=on_change,
-                                     style="Palette.Theme.Toolbutton", takefocus=True)
+                                     style="Palette.Theme.Toolbutton")
             row, column = divmod(index, 2)
             button.grid(row=row, column=column, sticky="ew", padx=(0, 6) if column == 0 else 0, pady=3)
             self.palette_buttons[name] = button

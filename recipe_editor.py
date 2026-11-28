@@ -288,8 +288,8 @@ class RecipeEditor(tk.Toplevel):
         self.detail_title = FittedLabel(panel, style="Detail.TLabel")
         self.detail_title.grid(row=0, column=0, sticky="ew", padx=12, pady=(0, 6))
         self.detail = text_field(panel, row=1, style="Surface.TFrame", width=42, height=6,
-                                 state="disabled", wrap="word", font=("Segoe UI", 10), padx=12,
-                                 spacing1=2, relief="flat", borderwidth=0, highlightthickness=0)
+                                 state="disabled", takefocus=True, wrap="word", font=("Segoe UI", 10), padx=12,
+                                 spacing1=2, relief="flat", borderwidth=0, highlightthickness=1)
         self.download_progress = DownloadProgress(panel)
         self.download_progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(8, 0))
         self.download_progress.grid_remove()
@@ -402,7 +402,9 @@ class RecipeEditor(tk.Toplevel):
         if self.detail is not None:
             self.detail.tag_configure("error", foreground=palette.error)
             self.detail.configure(bg=palette.surface, fg=palette.text, insertbackground=palette.text,
-                                  selectbackground=palette.selection, selectforeground=palette.text)
+                                  selectbackground=palette.selection, selectforeground=palette.text,
+                                  highlightbackground=palette.surface,
+                                  highlightcolor=palette.tab_indicator or palette.accent)
         if self.winfo_ismapped():
             self.apply_titlebar()
 

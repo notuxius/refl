@@ -100,9 +100,10 @@ def deletion_dialog(parent, palette, mode, name, detail, paths=(), *, blocked=Fa
         body.rowconfigure(2, weight=1)
         panel = ttk.Frame(body, style="Surface.TFrame", padding=1)
         panel.grid(row=2, sticky="nsew")
-        listing = tk.Text(panel, width=58, height=min(10, len(paths) + 2), wrap="word",
+        listing = tk.Text(panel, width=58, height=min(10, len(paths) + 2), wrap="word", takefocus=True,
                           font=("Segoe UI", 10), padx=8, pady=6, relief="flat", borderwidth=0,
                           background=palette.surface, foreground=palette.text,
+                          highlightbackground=palette.surface, highlightcolor=palette.tab_indicator or palette.accent,
                           selectbackground=palette.selection, selectforeground=palette.text)
         listing.insert("1.0", "\n".join(map(str, paths)))
         listing.configure(state="disabled")
@@ -158,10 +159,11 @@ class RelfUpdateDialog(tk.Toplevel):
         if notes.strip():
             panel = ttk.Frame(body, style="Surface.TFrame", padding=1)
             panel.grid(row=3, sticky="nsew", pady=(10, 0))
-            self.notes = tk.Text(panel, width=1, height=12, wrap="word", font=("Segoe UI", 10),
+            self.notes = tk.Text(panel, width=1, height=12, wrap="word", font=("Segoe UI", 10), takefocus=True,
                                  padx=8, pady=6, relief="flat", borderwidth=0, background=palette.surface,
                                  foreground=palette.text, selectbackground=palette.selection,
-                                 selectforeground=palette.text)
+                                 selectforeground=palette.text, highlightbackground=palette.surface,
+                                 highlightcolor=palette.tab_indicator or palette.accent)
             self.notes.insert("1.0", notes)
             self.notes.configure(state="disabled")
             grid_scrollable(self.notes)
@@ -609,11 +611,9 @@ class ShelfWindow:
         self.options_button.grid(row=1, column=0, sticky="ew", pady=padding)
         if self.sidebar_compact:
             self.sidebar_grip.place_forget()
-            self.sidebar_toggle.configure(padding="")
             self.sidebar_toggle.grid(row=0, column=0, sticky="ew", padx=0, pady=2)
         else:
             self.sidebar_grip.place(relx=1, anchor="ne", width=5, relheight=1, bordermode="outside")
-            self.sidebar_toggle.configure(padding=(8, 9))
             self.sidebar_toggle.grid(row=1, column=1, sticky="e", padx=(SIDEBAR_FOOTER_GAP, 0), pady=padding)
 
     def fit_sidebar_button(self, button):
@@ -946,7 +946,7 @@ class ShelfWindow:
             button.pack(side="left", padx=(0, 3))
             self.icon_widgets[button] = (icon, "text", 16)
         self.more_button = ttk.Button(manage, text="More", style="More.TMenubutton", width=-1,
-                                      compound="left", takefocus=True)
+                                      compound="left")
         self.icon_widgets[self.more_button] = ("more", "text", 16)
         self.more_menu = DropdownMenu(self.more_button)
         self.more_menu.add_action("Reload", self.reload, icon="reload")

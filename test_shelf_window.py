@@ -136,6 +136,11 @@ class DesktopTest(unittest.TestCase):
         button.invoke()
         self.wait_until_idle()
 
+    def press_key(self, key, focused):
+        self.root.focus_get().event_generate(f"<{key}>")
+        self.root.update()
+        self.assertIs(self.root.focus_get(), focused, key)
+
     def stage_pending_download_for(self, key):
         root = self.ui.jobs[key].cache_root(self.dest)
         saved = json.loads((root / "current.json").read_text())
@@ -800,6 +805,25 @@ class DesktopTest(unittest.TestCase):
                                  options.viewport.winfo_rooty() + options.viewport.winfo_height())
             self.assertTrue(options.close_button.winfo_viewable())
 
+    def test_options_arrows_follow_the_palette_grid(self):
+        self.root.deiconify()
+        self.ui.open_options()
+        options = self.ui.options
+        self.root.update()
+        modes = options.mode_buttons
+        modes["System"].focus_force()
+        self.press_key("Right", modes["Light"])
+        self.press_key("Left", modes["System"])
+        first, second, third, fourth = tuple(options.palette_buttons.values())[:4]
+        first.focus_set()
+        self.root.update()
+        self.press_key("Right", second)
+        self.press_key("Down", fourth)
+        self.press_key("Left", third)
+        self.press_key("Up", first)
+        self.press_key("Tab", second)
+        self.press_key("Shift-Tab", first)
+
     def assert_dropdown_join(self, trigger, menu, *, below):
         self.assertTrue(trigger.instate(["selected"]))
         self.assertEqual(menu.arrow.cget("text"), "▲")
@@ -864,6 +888,22 @@ class DesktopTest(unittest.TestCase):
         self.assertTrue(menu.winfo_viewable())
         self.assert_dropdown_join(trigger, menu, below=True)
         self.assertIs(menu.focus_get(), menu.buttons["en"])
+        index = menu.codes.index("en")
+        first, next_row = menu.codes[index:index + 2]
+        right = menu.codes[index + menu.rows]
+        self.press_key("Down", menu.buttons[next_row])
+        self.press_key("Up", menu.buttons[first])
+        self.press_key("Right", menu.buttons[right])
+        self.press_key("Right", menu.buttons[right])
+        self.press_key("Left", menu.buttons[first])
+        self.press_key("Tab", options.browse_button)
+        self.assertIs(self.root.grab_current(), options)
+        self.press_key("Shift-Tab", trigger)
+        self.press_key("Down", menu.buttons["en"])
+        self.press_key("Shift-Tab", options.close_button)
+        self.assertIs(self.root.grab_current(), options)
+        self.press_key("Tab", trigger)
+        self.press_key("Down", menu.buttons["en"])
         menu.focus_get().event_generate("<KeyPress-j>")
         self.root.update()
         self.assertIs(menu.focus_get(), menu.buttons["ja"])
@@ -1486,6 +1526,11 @@ class DesktopTest(unittest.TestCase):
         self.assertFalse(menu.winfo_viewable())
         self.assertTrue(trigger.instate(["!selected"]))
         self.assertIs(self.root.focus_get(), trigger)
+        self.press_key("Down", first)
+        self.press_key("Tab", self.ui.tree)
+        self.press_key("Shift-Tab", trigger)
+        self.press_key("Down", first)
+        self.press_key("Shift-Tab", self.ui.edit_button)
 
     def test_dropdowns_indicate_focus_with_fills(self):
         self.ui.options_button.invoke()
@@ -1503,10 +1548,55 @@ class DesktopTest(unittest.TestCase):
                     lookup = self.ui.style.lookup
                     self.assertEqual(lookup(style, "bordercolor", state), palette.line)
                     self.assertEqual(int(lookup(style, "borderwidth", state)), 1)
-                    self.assertEqual(int(lookup(style, "focusthickness", state)), 0)
                     for option in ("background", "lightcolor", "darkcolor"):
                         self.assertEqual(lookup(style, option, state), fill)
                     self.assertEqual(lookup(menu.arrow.cget("style"), "background", state), fill)
+
+    def test_focus_outlines_follow_keyboard_and_mouse_input(self):
+        self.root.deiconify()
+        self.ui.open_options()
+        options = self.ui.options
+        self.root.update()
+        choice = options.mode_buttons[self.ui.mode.get()]
+        choice.focus_force()
+        self.root.update()
+        self.assertTrue(choice.instate(["focus", "selected", "!user1"]))
+
+        choice.event_generate("<Tab>")
+        self.root.update()
+        focused = self.root.focus_get()
+        self.assertIsNot(focused, choice)
+        self.assertTrue(focused.instate(["focus", "user1"]))
+        self.assertTrue(choice.instate(["!user1"]))
+
+        # A widget that consumes the click must still clear the outline.
+        focused.bind("<Button-1>", lambda _: "break")
+        focused.event_generate("<Button-1>", x=5, y=5)
+        self.root.update()
+        self.assertIs(self.root.focus_get(), focused)
+        self.assertTrue(focused.instate(["focus", "!user1"]))
+        focused.event_generate("<KeyPress-Shift_L>")
+        self.assertTrue(focused.instate(["!user1"]))
+        focused.event_generate("<Shift-Tab>")
+        self.root.update()
+        self.assertIs(self.root.focus_get(), choice)
+        self.assertTrue(choice.instate(["focus", "selected", "user1"]))
+
+        trigger = options.language_button
+        trigger.focus_set()
+        self.root.update()
+        trigger.event_generate("<Down>")
+        self.root.update()
+        menu = options.language_menu
+        item = menu.focus_get()
+        self.assertIs(item, menu.buttons[self.ui.language])
+        self.assertTrue(item.instate(["focus", "user1"]))
+        item.event_generate("<Escape>")
+        self.root.update()
+        self.assertTrue(trigger.instate(["focus", "user1"]))
+        trigger.event_generate("<Button-1>", x=5, y=5)
+        self.root.update()
+        self.assertTrue(trigger.instate(["focus", "!user1"]))
 
     def click_header(self, column):
         tree = self.ui.tree
@@ -1957,6 +2047,12 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual(tree.set(row, "Available version"), "12.35.0")
         self.assertLessEqual(bar.winfo_rooty() + bar.winfo_height(),
                              ui.table_area.winfo_rooty() + ui.table_area.winfo_height())
+        tree.focus_force()
+        self.root.update()
+        self.press_key("Right", tree)
+        self.assertGreater(tree.xview()[0], 0)
+        self.press_key("Left", tree)
+        self.assertEqual(tree.xview()[0], 0)
         tree.xview_moveto(1)
         self.root.update()
         self.assertGreater(tree.xview()[0], 0)
@@ -2197,6 +2293,7 @@ class DesktopTest(unittest.TestCase):
 
                 toggle.invoke()
                 self.root.update()
+                collapsed_toggle_width = toggle.winfo_width()
                 for button, expected in icon_positions.items():
                     self.assertEqual(icon_left(button), expected, button["text"])
                 self.assertEqual(toggle.winfo_rootx(), options.winfo_rootx())
@@ -2211,6 +2308,7 @@ class DesktopTest(unittest.TestCase):
                 toggle.invoke()
                 self.root.update()
                 self.assertEqual((options.winfo_geometry(), toggle.winfo_geometry()), expanded)
+                self.assertEqual(toggle.winfo_width(), collapsed_toggle_width)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows sidebar presentation")
     def test_sidebar_toggle_reveals_only_the_finished_layout(self):
@@ -2918,6 +3016,110 @@ class DesktopTest(unittest.TestCase):
         self.assertIsNone(self.root.grab_current())
         self.assertIs(self.root.focus_get(), tree)
 
+    def test_main_window_navigation_skips_unavailable_controls(self):
+        self.root.deiconify()
+        self.root.update()
+        ui = self.ui
+        ui.nav_buttons["checklist"].focus_force()
+        self.press_key("Down", ui.nav_buttons["all"])
+        self.press_key("Down", ui.categories_button)
+        self.press_key("Up", ui.nav_buttons["all"])
+
+        ui.add_button.focus_set()
+        self.root.update()
+        self.press_key("Right", ui.edit_button)
+        ui.edit_button.state(["disabled"])
+        self.press_key("Left", ui.add_button)
+        self.press_key("Right", ui.more_button)
+        self.press_key("Shift-Tab", ui.add_button)
+        self.press_key("Tab", ui.more_button)
+
+        ui.category_list.focus_force()
+        self.root.update()
+        self.press_key("Down", ui.category_list)
+        self.assertEqual(ui.category_list.selection(), ("category:",))
+        self.assertEqual(ui.view.get(), "category:")
+
+        ui.tree.focus_force()
+        self.root.update()
+        self.press_key("Down", ui.tree)
+        self.assertEqual(ui.tree.selection(), (self.keys[1],))
+        self.press_key("Up", ui.tree)
+        self.assertEqual(ui.tree.selection(), (self.keys[0],))
+
+    def test_editor_keyboard_navigation_through_multiline_fields(self):
+        path = self.ui.catalog / "setup.json"
+        step = {"label": "First", "description": "Description", "powershell": "'one'"}
+        path.write_text(json.dumps({"id": "setup", "type": "checklist", "steps": [step, step]}))
+        self.root.deiconify()
+        self.root.update()
+        self.ui.open_editor(path)
+        self.root.update()
+        editor = self.ui.editor
+        editor.tabs.focus_force()
+        self.press_key("Right", editor.tabs)
+        self.assertEqual(editor.tabs.tab("current", "text"), "Checklist")
+        self.press_key("Tab", editor.listing)
+        self.press_key("Down", editor.listing)
+        self.assertEqual(editor.listing.selection(), ("1",))
+        self.press_key("Shift-Tab", editor.tabs)
+        self.press_key("Left", editor.tabs)
+        self.assertEqual(editor.tabs.tab("current", "text"), "General")
+
+        editor.picker.focus_set()
+        self.root.update()
+        editor.picker.event_generate("<Down>")
+        self.root.update()
+        popdown = str(self.root.tk.call("ttk::combobox::PopdownWindow", editor.picker))
+        listbox = f"{popdown}.f.l"
+        self.assertEqual(str(self.root.tk.call("focus")), listbox)
+        self.root.tk.call("event", "generate", listbox, "<Down>")
+        self.root.tk.call("event", "generate", listbox, "<Tab>")
+        self.root.update()
+        self.assertIs(self.root.focus_get(), editor.label_entry)
+        self.assertIs(self.root.grab_current(), editor)
+        self.press_key("Shift-Tab", editor.picker)
+        previous_field = editor.picker.tk_focusPrev()
+        editor.picker.event_generate("<Down>")
+        self.root.update()
+        self.root.tk.call("event", "generate", listbox, "<Shift-Tab>")
+        self.root.update()
+        self.assertIs(self.root.focus_get(), previous_field)
+        self.assertIs(self.root.grab_current(), editor)
+        self.press_key("Tab", editor.picker)
+        self.press_key("Tab", editor.label_entry)
+        self.press_key("Tab", editor.description)
+        editor.description.mark_set("insert", "1.0")
+        self.press_key("Right", editor.description)
+        self.assertEqual(editor.description.index("insert"), "1.1")
+        self.press_key("Tab", editor.script)
+        self.press_key("Shift-Tab", editor.description)
+        self.press_key("Shift-Tab", editor.label_entry)
+        self.assertEqual(editor.description.get("1.0", "end-1c"), step["description"])
+        editor.close_button.invoke()
+
+        self.ui.open_editor(Path(self.keys[0]))
+        editor = self.ui.editor
+        self.root.update()
+        editor.tabs.focus_force()
+        self.press_key("Right", editor.tabs)
+        self.assertEqual(editor.tabs.tab("current", "text"), "Download options")
+        self.press_key("Tab", editor.text_area.tk_focusPrev())
+        self.press_key("Tab", editor.text_area)
+        next_field = editor.text_area.tk_focusNext()
+        self.press_key("Tab", next_field)
+        self.press_key("Shift-Tab", editor.text_area)
+        info = next(tab for tab in editor.tabs.tabs() if editor.tabs.tab(tab, "text") == "Item info")
+        editor.tabs.select(info)
+        self.root.update()
+        editor.tabs.focus_set()
+        self.root.update()
+        self.press_key("Tab", editor.detail)
+        editor.detail.mark_set("insert", "1.0")
+        self.press_key("Down", editor.detail)
+        self.assertNotEqual(editor.detail.index("insert"), "1.0")
+        self.press_key("Shift-Tab", editor.tabs)
+
     def test_theme_switch_persistence_and_system_changes(self):
         self.ui.tree.selection_set(self.keys[1])
         with patch("shelf_window.system_mode", return_value="Dark") as windows:
@@ -2978,6 +3180,10 @@ class DesktopTest(unittest.TestCase):
                     options.palette_buttons[name].invoke()
                     self.assertIs(self.ui.palette, palette)
                     self.assertEqual(self.ui.style.lookup("Primary.TButton", "background"), palette.accent)
+                    for image, color in (("RelfFocusOutline", palette.tab_indicator or palette.accent),
+                                         ("RelfFocusOnAccent", palette.on_accent)):
+                        rgb = tuple(channel // 257 for channel in self.root.winfo_rgb(color))
+                        self.assertEqual(self.root.tk.call(image, "get", 0, 0), rgb)
                     self.assertEqual(self.ui.style.lookup("Treeview", "background", ["selected", "focus"]),
                                      palette.selection)
                     self.assertEqual(self.ui.style.lookup(button_style, "background", ["focus"]), palette.selection)

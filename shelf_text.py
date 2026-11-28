@@ -134,6 +134,22 @@ class FittedTreeview(ttk.Treeview):
             self.bind(event, self.schedule_fit, add="+")
         self.bind("<<ThemeChanged>>", self.theme_changed)
         self.bind("<Double-Button-1>", self.autofit_divider)
+        self.bind("<Up>", lambda _: self.start_row_navigation(-1))
+        self.bind("<Down>", lambda _: self.start_row_navigation(1))
+        self.bind("<Left>", lambda _: self.scroll_columns(-1))
+        self.bind("<Right>", lambda _: self.scroll_columns(1))
+
+    def start_row_navigation(self, step):
+        if not self.focus() and (rows := self.get_children()):
+            row = rows[0] if step > 0 else rows[-1]
+            self.focus(row)
+            self.selection_set(row)
+            self.see(row)
+            return "break"
+
+    def scroll_columns(self, step):
+        self.xview_scroll(step, "units")
+        return "break"
 
     def autofit_divider(self, event):
         if self.identify_region(event.x, event.y) != "separator":

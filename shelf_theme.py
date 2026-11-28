@@ -1,14 +1,17 @@
 """Appearance settings and ttk palettes for the Relf desktop window."""
 
+from contextlib import suppress
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
+import tkinter as tk
 from tkinter import ttk
 
 from shelf_checkboxes import style_checkboxes
+from shelf_focus import arrow_focus, tab_focus
 from shelf_text import TREE_TEXT_PAD
 
 THEME_MODES = ("System", "Light", "Dark")
@@ -323,10 +326,79 @@ def style_editor_tabs(style, palette):
     style.map(tab, padding=[("selected", padding)], foreground=[("selected", palette.text), ("active", palette.text)])
 
 
+def bind_focus_input(root):
+    tag = "RelfFocusInput"
+    arrows = "RelfArrowFocus"
+    tabs = "RelfTabFocus"
+    keyboard = False
+
+    def watch(widget):
+        tags = root.tk.call("bindtags", str(widget))
+        if tag not in tags:
+            # Let specific widget bindings, such as Down on More, run first.
+            if isinstance(widget, (ttk.Button, ttk.Checkbutton, ttk.Radiobutton)):
+                tags = (tags[0], arrows, *tags[1:])
+            elif isinstance(widget, tk.Text):
+                tags = (tags[0], tabs, *tags[1:])
+            root.tk.call("bindtags", str(widget), (tag, *tags))
+
+    def mark_focus(widget, visible):
+        if isinstance(widget, ttk.Widget):
+            widget.state(["user1" if visible else "!user1"])
+
+    def input_changed(event):
+        nonlocal keyboard
+        from_keyboard = event.type == tk.EventType.KeyPress
+        if from_keyboard and event.keysym.removesuffix("_L").removesuffix("_R") in {
+            "Shift", "Control", "Alt", "Meta", "Super", "Caps_Lock", "Num_Lock", "Scroll_Lock", "ISO_Level3_Shift",
+        }:
+            return
+        if keyboard != from_keyboard:
+            keyboard = from_keyboard
+            with suppress(KeyError):  # Tk can focus a combobox listbox created in Tcl.
+                mark_focus(root.focus_get(), keyboard)
+
+    # Handle input before widget bindings that can consume it, including in popups.
+    watch(root)
+    root.bind_all("<Map>", lambda event: watch(event.widget), add="+")
+    root.bind_class(tag, "<KeyPress>", input_changed)
+    root.bind_class(tag, "<ButtonPress>", input_changed)
+    root.bind_class(tag, "<FocusIn>", lambda event: mark_focus(event.widget, keyboard))
+    root.bind_class(tag, "<FocusOut>", lambda event: mark_focus(event.widget, False))
+    for key in ("Up", "Down", "Left", "Right"):
+        root.bind_class(arrows, f"<{key}>", arrow_focus)
+    root.bind_class(tabs, "<<NextWindow>>", lambda event: tab_focus(event.widget, 1))
+    root.bind_class(tabs, "<<PrevWindow>>", lambda event: tab_focus(event.widget, -1))
+
+
+def style_focus_outlines(style, palette):
+    blank, outline, on_accent = "RelfFocusBlank", "RelfFocusOutline", "RelfFocusOnAccent"
+    width, height = 256, 48
+    if "focus" not in style.element_names():
+        for image in (blank, outline, on_accent):
+            style.tk.call("image", "create", "photo", image, "-width", width, "-height", height)
+        # Keep Tk's one-pixel focus padding in both input modes.
+        geometry = dict(border=1, padding=1, width=2, height=2, sticky="nsew")
+        style.element_create("focus", "image", blank, ("focus", "user1", outline), **geometry)
+        style.element_create("Toolbutton.focus", "image", blank,
+                             ("selected", "focus", "user1", on_accent), ("focus", "user1", outline), **geometry)
+        style.element_create("Relf.accentFocus", "image", blank, ("focus", "user1", on_accent), **geometry)
+        layout = style.layout("TButton")
+        children = layout[0][1]["children"]
+        children[0] = ("Relf.accentFocus", children[0][1])
+        style.layout("Primary.TButton", layout)
+        bind_focus_input(style.master._root())
+    for image, color in ((outline, palette.tab_indicator or palette.accent), (on_accent, palette.on_accent)):
+        for edge in ((0, 0, width, 1), (0, height - 1, width, height),
+                     (0, 1, 1, height - 1), (width - 1, 1, width, height - 1)):
+            style.tk.call(image, "put", color, "-to", *edge)
+
+
 def style_widgets(s, p):
+    style_focus_outlines(s, p)
     s.configure(".", background=p.canvas, foreground=p.text, font=("Segoe UI", 10),
                 bordercolor=p.line, lightcolor=p.surface, darkcolor=p.surface,
-                troughcolor=p.canvas, focusthickness=0)
+                troughcolor=p.canvas)
     s.configure("Surface.TFrame", background=p.surface)
     s.configure("TSizegrip", background=p.surface)
     s.configure("Line.TFrame", background=p.line)
@@ -449,7 +521,8 @@ def style_widgets(s, p):
     s.configure("Categories.Treeview.Item", padding=(16, 0, 0, 0))
     s.layout("Compact.Categories.Treeview.Item", [("Treeitem.image", {"sticky": ""})])
     # Keep tagged error text visible on the selection background.
-    s.map("Treeview", background=[("selected", p.selection)], foreground=[])
+    s.map("Treeview", background=[("selected", "focus", "user1", selected_focus), ("selected", p.selection)],
+          foreground=[])
     style_heading_dividers(s, p.line)
     s.configure("Treeview.Heading", font=HEADING_FONT, background=p.canvas,
                 foreground=p.muted, padding=(TREE_TEXT_PAD, 8), relief="flat", borderwidth=0)
