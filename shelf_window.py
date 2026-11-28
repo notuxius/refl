@@ -56,8 +56,10 @@ from shelf_version import __version__
 
 
 APPLY_ACTIONS = {"apply_selected": "Apply selected", "apply_all": "Apply all items"}
-ALL_ACTIONS = {"fetch": "Update all items", "verify": "Verify all items", **APPLY_ACTIONS}
-BULK_ICONS = {**ACTION_ICONS, "apply_selected": "list_checks", "apply_all": "list_checks"}
+ALL_ACTIONS = {"fetch": "Update all items", "fetch_selected": "Update selected",
+               "verify": "Verify all items", **APPLY_ACTIONS}
+BULK_ICONS = {**ACTION_ICONS, "fetch_selected": ACTION_ICONS["fetch"],
+              "apply_selected": "list_checks", "apply_all": "list_checks"}
 VIEWS = {"checklist": "Checklist", "all": "Tracked", "local": "Local only", "updates": "Available updates",
          "progress": "In progress", "attention": "Needs attention", "disabled": "Disabled"}
 WORKING = {"check": "Checking", "fetch": "Updating", "resume": "Updating", "verify": "Verifying", "apply": "Applying"}
@@ -538,8 +540,10 @@ class ShelfWindow:
                                             command=self.toggle_categories)
         self.icon_widgets[self.categories_button] = ("tags", "text", 20)
         self.categories_button.grid(row=len(VIEWS), column=0, sticky="ew", pady=2)
-        self.categories_arrow = tk.Canvas(self.categories_button, highlightthickness=0, borderwidth=0, takefocus=0)
-        self.arrow_glyph = self.categories_arrow.create_text(0, 0, text=ARROW_DOWN)
+        self.categories_arrow = tk.Label(self.categories_button, highlightthickness=0, borderwidth=0,
+                                         padx=0, pady=0, takefocus=0)
+        icon = "list_chevron_up" if self.categories_expanded else "list_chevron_down"
+        self.icon_widgets[self.categories_arrow] = (icon, "text", 20)
         bind_button_badge(self.categories_button, self.categories_arrow, self.sync_categories_button)
         self.sidebar_body = ttk.Frame(rail, style="Sidebar.TFrame")
         self.sidebar_body.grid(row=len(VIEWS) + 1, column=0, sticky="nsew")
@@ -699,6 +703,7 @@ class ShelfWindow:
             button.configure(compound="image" if compact else "left",
                              style="Compact.Nav.TButton" if compact else "Nav.TButton")
             self.fit_sidebar_button(button)
+        self.refresh_icon(self.categories_button)
         self.category_list.configure(displaycolumns=() if compact else "#all",
                                      style="Compact.Categories.Treeview" if compact else "Categories.Treeview")
         icon_width = self.categories_button.winfo_reqwidth() if compact else 36
@@ -718,8 +723,6 @@ class ShelfWindow:
         if self.category_groups:
             self.categories_button.grid()
             self.sync_categories_button()
-            if not self.sidebar_compact:
-                self.categories_arrow.itemconfigure(self.arrow_glyph, angle=0 if self.categories_expanded else 90)
         else:
             self.categories_button.grid_remove()
         if self.category_groups and self.categories_expanded:
@@ -761,6 +764,11 @@ class ShelfWindow:
 
     def toggle_categories(self):
         self.categories_expanded = not self.categories_expanded
+        icon = "list_chevron_up" if self.categories_expanded else "list_chevron_down"
+        self.icon_widgets[self.categories_arrow] = (icon, "text", 20)
+        self.refresh_icon(self.categories_arrow)
+        if self.sidebar_compact:
+            self.refresh_icon(self.categories_button)
         self.position_categories()
         try:
             write_preference(self.categories_file, "expanded\n" if self.categories_expanded else "collapsed\n")
@@ -929,7 +937,7 @@ class ShelfWindow:
         batch = ttk.Frame(bar, style="Surface.TFrame")
         batch.grid(row=0, column=0, sticky="w")
         self.all_buttons = {}
-        for action in ("fetch", *APPLY_ACTIONS):
+        for action in ("fetch", "fetch_selected", *APPLY_ACTIONS):
             primary = action in ("fetch", "apply_selected")
             button = ttk.Button(batch, text=ALL_ACTIONS[action], command=lambda a=action: self.bulk_command(a),
                                 style="Primary.TButton" if primary else "Command.TButton", width=-1, compound="left")
@@ -1732,11 +1740,6 @@ class ShelfWindow:
             return
         self.palette = palette
         style_widgets(self.style, palette)
-        font = self.style.lookup("Treeview.Heading", "font")
-        side = self.root.tk.getint(self.root.tk.call("font", "metrics", font, "-linespace"))
-        self.categories_arrow.configure(width=side, height=side)
-        self.categories_arrow.coords(self.arrow_glyph, side / 2, side / 2)
-        self.categories_arrow.itemconfigure(self.arrow_glyph, font=font, fill=palette.text)
         self.sync_categories_button()
         self.tree.tag_configure("error", foreground=palette.error)
         self.app_column_icon = make_icon(self.root, "picture_frame", palette.muted)
@@ -1769,7 +1772,10 @@ class ShelfWindow:
         color = getattr(self.palette, color)
         if isinstance(widget, ttk.Button):
             disabled = self.style.lookup(widget.cget("style"), "foreground", ("disabled",))
-            self.images[widget] = set_button_icon(widget, name, color, disabled, size)
+            chevron = None
+            if widget is self.categories_button and self.sidebar_compact:
+                chevron = self.icon_widgets[self.categories_arrow][0]
+            self.images[widget] = set_button_icon(widget, name, color, disabled, size, list_chevron=chevron)
         else:
             icon = make_icon(self.root, name, color, size)
             widget.configure(image=icon)
@@ -2593,6 +2599,8 @@ class ShelfWindow:
             if action in APPLY_ACTIONS:
                 eligible = self.checked_items if action == "apply_selected" else any(
                     isinstance(job, Checklist) for job in self.jobs.values())
+            elif action == "fetch_selected":
+                eligible = self.selected_update_key() is not None
             else:
                 eligible = any(eligible_for_action(action, job) for job in self.jobs.values())
             state = "normal" if eligible and not self.busy else "disabled"
@@ -2614,9 +2622,19 @@ class ShelfWindow:
         if self.editor is not None:
             self.editor.set_busy(self.busy)
 
+    def selected_update_key(self):
+        key = next(iter(self.tree.selection()), None)
+        job = self.jobs.get(key)
+        if isinstance(job, Recipe) and eligible_for_action("fetch", job):
+            return key
+        return None
+
     def bulk_command(self, action):
         if action == self.bulk_action:
             self.cancel()
+        elif action == "fetch_selected":
+            if (key := self.selected_update_key()) is not None:
+                self.start("fetch", key=key, bulk_action=action)
         else:
             self.start(action)
 
@@ -2637,7 +2655,7 @@ class ShelfWindow:
             self.set_status("Canceling…")
         self.controls()
 
-    def start(self, action, *, key=None, install=False, keys=None):
+    def start(self, action, *, key=None, install=False, keys=None, bulk_action=None):
         if keys is None:
             keys = self.jobs if key is None else (key,)
         if action in APPLY_ACTIONS:
@@ -2652,7 +2670,7 @@ class ShelfWindow:
         self.cancel_events = {recipe_key: Event() for recipe_key in keys}
         self.install_key = key if install else None
         self.requested_action = "install" if install else action
-        self.bulk_action = action if key is None and action != "resume" else None
+        self.bulk_action = bulk_action or (action if key is None and action != "resume" else None)
         self.total, self.finished, self.canceled, self.failure = len(keys), 0, 0, ""
         self.batch_outcomes = Counter()
         self.unresolved_checks = set(keys) if action == "fetch" else set()
@@ -2673,7 +2691,7 @@ class ShelfWindow:
             Thread(target=run_batch, args=(self.events, action, items, self.dest, self.targets),
                    kwargs={"retry_delays": delays, "app_folder": self.app_root,
                            "previous_versions": self.previous_versions}).start()
-        label = ACTIONS["fetch"] if action == "resume" else (ALL_ACTIONS if key is None else ACTIONS)[action]
+        label = ALL_ACTIONS[self.bulk_action] if self.bulk_action else ACTIONS["fetch" if action == "resume" else action]
         if install:
             label = "Install"
         self.root.after(50, self.poll, action, label)

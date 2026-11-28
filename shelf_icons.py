@@ -14,7 +14,8 @@ NAMES = ("eye", "updates", "problems", "search", "add", "check",
          "window_close", "info", "folders", "list_checks", "diskette_x", "pause_circle", "folder",
          "folder_open", "tag", "file_x", "folder_x", "headphones", "code_xml", "monitor",
          "refresh_cw", "hard_drive", "gamepad", "cpu", "globe", "disc", "layers", "briefcase",
-         "shield", "wrench", "package_minus", "paintbrush", "inbox", "tags")
+         "shield", "wrench", "package_minus", "paintbrush", "inbox", "tags",
+         "list_chevron_down", "list_chevron_up")
 
 CATEGORY_SYMBOLS = {
     "audio": "headphones", "video": "headphones", "development": "code_xml",
@@ -65,8 +66,15 @@ def make_icon(master, name, color, size=16):
     return icon
 
 
-def set_button_icon(button, name, color, disabled_color, size=16):
+def set_button_icon(button, name, color, disabled_color, size=16, *, list_chevron=None):
     normal = make_icon(button, name, color, size)
     disabled = make_icon(button, name, disabled_color, size)
+    if list_chevron is not None:
+        # Center just the chevron from the list icon below the main icon.
+        for image, tint in ((normal, color), (disabled, disabled_color)):
+            chevron = make_icon(button, list_chevron, tint, 20)
+            image.configure(height=size + 6)
+            image.tk.call(str(image), "copy", str(chevron),
+                          "-from", 9, 7, 18, 13, "-to", (size - 9) // 2, size)
     button.configure(image=(normal, "disabled", disabled))
     return normal, disabled

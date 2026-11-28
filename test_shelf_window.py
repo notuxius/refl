@@ -567,6 +567,7 @@ class DesktopTest(unittest.TestCase):
         ui.reload()
         self.assertEqual(ui.tree.get_children(), (first,))
         self.assertEqual(ui.tree.set(first, "Status"), "Disabled")
+        self.assertTrue(ui.all_buttons["fetch_selected"].instate(["disabled"]))
         ui.start("fetch", key=first)
         self.assertFalse(ui.busy)
         ui.open_editor(Path(first))
@@ -1153,6 +1154,7 @@ class DesktopTest(unittest.TestCase):
         selected, apply_all = (ui.all_buttons[action] for action in ("apply_selected", "apply_all"))
         self.assertNotIn("check", ui.all_buttons)
         self.assertFalse(ui.all_buttons["fetch"].winfo_ismapped())
+        self.assertFalse(ui.all_buttons["fetch_selected"].winfo_ismapped())
         self.assertTrue(selected.winfo_ismapped() and apply_all.winfo_ismapped())
         self.assertTrue(selected.instate(["disabled"]))
         x, y, w, h = tree.bbox(keys[0], "#0")
@@ -2715,7 +2717,7 @@ class DesktopTest(unittest.TestCase):
         self.root.deiconify()
         self.root.update()
         self.assertTrue(ui.category_list.winfo_viewable())
-        for expanded, angle in ((False, 90), (True, 0)):
+        for expanded in (False, True):
             if expanded:
                 ui.categories_button.invoke()
             else:
@@ -2723,14 +2725,18 @@ class DesktopTest(unittest.TestCase):
                 ui.categories_arrow.event_generate("<ButtonRelease-1>", x=5, y=5)
             window = tk.Toplevel(self.root)
             self.addCleanup(window.destroy)
-            ui = ShelfWindow(window, ui.catalog, self.dest, ui.targets, appearance_file=self.appearance)
+            reopened = ShelfWindow(window, ui.catalog, self.dest, ui.targets, appearance_file=self.appearance)
             self.root.update()
-            self.assertEqual(bool(ui.category_list.winfo_viewable()), expanded)
-            self.assertEqual(ui.categories_button.cget("text"), tr("Categories"))
-            arrow = ui.categories_arrow
-            self.assertEqual(arrow.itemcget(ui.arrow_glyph, "text"), "▼")
-            self.assertEqual(float(arrow.itemcget(ui.arrow_glyph, "angle")), angle)
-            self.assertEqual(arrow.itemcget(ui.arrow_glyph, "font"), ui.style.lookup("Treeview.Heading", "font"))
+            for current in (ui, reopened):
+                self.assertEqual(bool(current.category_list.winfo_viewable()), expanded)
+                self.assertEqual(current.categories_button.cget("text"), tr("Categories"))
+                arrow = current.categories_arrow
+                icon = current.images[arrow][0]
+                self.assertEqual(arrow.cget("image"), str(icon))
+                self.assertEqual((icon.width(), icon.height()), (20, 20))
+                self.assertEqual(icon.transparency_get(13, 8), not expanded)
+                self.assertEqual(icon.transparency_get(13, 11), expanded)
+            ui = reopened
 
     def test_sidebar_categories_filter_search_and_follow_catalog_changes(self):
         ui = self.ui
@@ -2795,6 +2801,11 @@ class DesktopTest(unittest.TestCase):
             self.assertEqual(bool(listing.winfo_viewable()), visible)
             self.assertFalse(ui.categories_arrow.winfo_viewable())
             self.assertEqual(header.instate(["selected"]), visible)
+            icon = ui.images[header][0]
+            self.assertEqual(header.cget("image")[0], str(icon))
+            self.assertEqual((icon.width(), icon.height()), (20, 26))
+            self.assertEqual(icon.transparency_get(9, 21), not visible)
+            self.assertEqual(icon.transparency_get(9, 24), visible)
             self.assertTrue(ui.sidebar_compact)
             self.assertEqual(ui.sidebar.winfo_width(), compact_width)
         self.assertEqual(listing.selection(), (hardware,))
@@ -3848,6 +3859,41 @@ class DesktopTest(unittest.TestCase):
         self.assertEqual([self.ui.results[k].status for k in self.keys],
                          ["Updated", "Updated"])
         self.assertEqual(self.ui.tree.selection(), ())
+
+    def test_update_selected_targets_only_the_app_selected_at_click(self):
+        ui, tree = self.ui, self.ui.tree
+        first, second = self.keys
+        button = ui.all_buttons["fetch_selected"]
+        tree.selection_remove(*tree.selection())
+        self.root.update()
+        self.assertTrue(button.instate(["disabled"]))
+        button.invoke()
+        self.assertFalse(ui.busy)
+
+        tree.selection_set(second)
+        self.root.update()
+        self.assertTrue(button.instate(["!disabled"]))
+        publisher = GatedPage()
+        with (patch("fetch_sources.read_page", side_effect=publisher) as check,
+              patch("fetch_sources.open_url", side_effect=download_fixture) as download):
+            button.invoke()
+            try:
+                self.wait_for(publisher.entered.is_set)
+                tree.selection_set(first)
+                self.root.update()
+                self.assertEqual(button.cget("text"), "Cancel")
+                self.assertTrue(button.instate(["!disabled"]))
+                self.assertTrue(ui.all_buttons["fetch"].instate(["disabled"]))
+            finally:
+                publisher.resume.set()
+                self.wait_until_idle()
+            check.assert_called_once()
+            download.assert_called_once_with("https://publisher.example/beta.bin")
+        self.assertEqual(ui.results[first].status, "Unknown")
+        self.assertEqual(ui.results[second].status, "Updated")
+        self.assertIn("Update selected finished", ui.status.get())
+        ui.change_language("uk")
+        self.assertEqual(button.cget("text"), "Оновити вибрану програму")
 
     def test_cancel_bulk_work_stops_active_app_and_skips_rest(self):
         self.root.deiconify()
