@@ -176,3 +176,7 @@ $tests = Start-Job -ArgumentList (Get-Location).Path -ScriptBlock {
 Use `Receive-Job $tests -Wait` to read the results. On Windows, `run_tests.py` puts the GUI tests on a private desktop. It accepts standard unittest arguments for targeted runs.
 
 The default suite supplies publisher responses at the HTTP boundary. It exercises the CLI, real filesystem writes, Windows executable metadata and Windows file locking. On a host that permits loopback connections, set `RELEASESHELF_HTTP_TEST=1` to exercise local HTTP and CLI subprocesses.
+
+## License
+
+Relf’s original code is available under the [MIT License](LICENSE). The bundled Lucide and Feather icons carry their [ISC and MIT notices](assets/lucide-LICENSE.txt).
